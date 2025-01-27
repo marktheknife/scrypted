@@ -1,5 +1,6 @@
 import { once } from 'events';
 import net from 'net';
+import tls from 'tls';
 
 export class ListenZeroSingleClientTimeoutError extends Error {
     constructor() {
@@ -7,14 +8,14 @@ export class ListenZeroSingleClientTimeoutError extends Error {
     }
 }
 
-export async function listenZero(server: net.Server, hostname?: string) {
-    server.listen(0, hostname);
+export async function listenZero(server: net.Server, hostname: string) {
+    server.listen(0, hostname || '127.0.0.1');
     await once(server, 'listening');
     return (server.address() as net.AddressInfo).port;
 }
 
-export async function listenZeroSingleClient(hostname?: string, options?: net.ServerOpts) {
-    const server = new net.Server(options);
+export async function listenZeroSingleClient(hostname: string, options?: net.ServerOpts & { tls?: boolean }, listenTimeout = 30000) {
+    const server = options?.tls ? new tls.Server(options) : new net.Server(options);
     const port = await listenZero(server, hostname);
 
     let cancel: () => void;
@@ -22,7 +23,7 @@ export async function listenZeroSingleClient(hostname?: string, options?: net.Se
         const timeout = setTimeout(() => {
             server.close();
             reject(new ListenZeroSingleClientTimeoutError());
-        }, 30000);
+        }, listenTimeout);
         cancel = () => {
             clearTimeout(timeout);
             server.close();

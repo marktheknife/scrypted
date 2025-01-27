@@ -40,7 +40,7 @@ export function createAsyncQueue<T>() {
             return false;
 
         if (waiting.length) {
-            const deferred = waiting.shift();
+            const deferred = waiting.shift()!;
             dequeued?.resolve();
             deferred.resolve(item);
             return true;
@@ -66,7 +66,7 @@ export function createAsyncQueue<T>() {
             dequeued?.reject(new Error('abort'));
         };
 
-        dequeued.promise.catch(() => {}).finally(() => signal.removeEventListener('abort', h));
+        dequeued?.promise.catch(() => {}).finally(() => signal.removeEventListener('abort', h));
         signal.addEventListener('abort', h);
 
         return true;
@@ -79,7 +79,7 @@ export function createAsyncQueue<T>() {
         ended = e || new EndError();
         endDeferred.resolve();
         while (waiting.length) {
-            waiting.shift().reject(ended);
+            waiting.shift()!.reject(ended);
         }
         return true;
     }
@@ -94,7 +94,7 @@ export function createAsyncQueue<T>() {
                     }
                     catch (e) {
                         // the yield above may raise an error, and the queue should be ended.
-                        end(e);
+                        end(e as Error);
                         if (e instanceof EndError)
                             return;
                         throw e;
@@ -153,6 +153,23 @@ export function createAsyncQueue<T>() {
             return queue();
         }
     }
+}
+
+export function createAsyncQueueFromGenerator<T>(generator: AsyncGenerator<T>) {
+    const q = createAsyncQueue<T>();
+    (async() => {
+        try {
+            for await (const i of generator) {
+                await q.enqueue(i);
+            }
+        }
+        catch (e) {
+            q.end(e as Error);
+        }
+        q.end();
+    })();
+
+    return q;
 }
 
 // async function testSlowEnqueue() {

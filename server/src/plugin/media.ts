@@ -1,14 +1,13 @@
-import { BufferConverter, DeviceManager, FFmpegInput, MediaManager, MediaObject as MediaObjectInterface, MediaObjectOptions, MediaStreamUrl, ScryptedDevice, ScryptedInterface, ScryptedInterfaceProperty, ScryptedMimeTypes, ScryptedNativeId, SystemDeviceState, SystemManager } from "@scrypted/types";
-import pathToFfmpeg from 'ffmpeg-static';
+import { BufferConverter, DeviceManager, FFmpegInput, MediaConverter, MediaManager, MediaObjectCreateOptions, MediaObject as MediaObjectInterface, MediaStreamUrl, ScryptedDevice, ScryptedInterface, ScryptedInterfaceProperty, ScryptedMimeTypes, ScryptedNativeId, SystemDeviceState, SystemManager } from "@scrypted/types";
 import fs from 'fs';
 import https from 'https';
 import Graph from 'node-dijkstra';
-import os from 'os';
 import path from 'path';
+import send from 'send';
 import MimeType from 'whatwg-mimetype';
+import { getScryptedFFmpegPath } from './ffmpeg-path';
 import { MediaObject } from "./mediaobject";
 import { MediaObjectRemote } from "./plugin-api";
-import send from 'send';
 
 function typeMatches(target: string, candidate: string): boolean {
     // candidate will accept anything
@@ -161,8 +160,11 @@ export abstract class MediaManagerBase implements MediaManager {
     }
 
     async convertMediaObjectToJSON<T>(mediaObject: MediaObjectInterface, toMimeType: string): Promise<T> {
-        const buffer = await this.convertMediaObjectToBuffer(mediaObject, toMimeType);
-        return JSON.parse(buffer.toString());
+        const json = await this.convertMediaObjectToBuffer(mediaObject, toMimeType);
+        // backcompat
+        if (json && (Buffer.isBuffer(json) || typeof json === 'string'))
+            return JSON.parse(json.toString());
+        return json as T;
     }
 
     abstract getSystemState(): { [id: string]: { [property: string]: SystemDeviceState } };
@@ -171,25 +173,7 @@ export abstract class MediaManagerBase implements MediaManager {
     abstract getMixinConsole(mixinId: string, nativeId: ScryptedNativeId): Console;
 
     async getFFmpegPath(): Promise<string> {
-        // try to get the ffmpeg path as a value of another variable
-        // ie, in docker builds:
-        //     export SCRYPTED_FFMPEG_PATH_ENV_VARIABLE=SCRYPTED_RASPBIAN_FFMPEG_PATH
-        const v = process.env.SCRYPTED_FFMPEG_PATH_ENV_VARIABLE;
-        if (v) {
-            const f = process.env[v];
-            if (f && fs.existsSync(f))
-                return f;
-        }
-
-        // try to get the ffmpeg path from a variable
-        // ie:
-        //     export SCRYPTED_FFMPEG_PATH=/usr/local/bin/ffmpeg
-        const f = process.env.SCRYPTED_FFMPEG_PATH;
-        if (f && fs.existsSync(f))
-            return f;
-
-        const defaultPath = os.platform() === 'win32' ? 'ffmpeg.exe' : 'ffmpeg';
-        return pathToFfmpeg || defaultPath;
+        return getScryptedFFmpegPath();
     }
 
     async getFilesPath(): Promise<string> {
@@ -204,7 +188,7 @@ export abstract class MediaManagerBase implements MediaManager {
     }
 
     getConverters(): IdBufferConverter[] {
-        const converters = Object.entries(this.getSystemState())
+        const bufferConverters = Object.entries(this.getSystemState())
             .filter(([id, state]) => state[ScryptedInterfaceProperty.interfaces]?.value?.includes(ScryptedInterface.BufferConverter))
             .map(([id]) => {
                 const device = this.getDeviceById<BufferConverter>(id);
@@ -218,6 +202,29 @@ export abstract class MediaManagerBase implements MediaManager {
                     },
                 } as IdBufferConverter;
             });
+
+        const mediaConverters = Object.entries(this.getSystemState())
+            .filter(([id, state]) => state[ScryptedInterfaceProperty.interfaces]?.value?.includes(ScryptedInterface.MediaConverter))
+            .map(([id]) => {
+                const device = this.getDeviceById<MediaConverter & BufferConverter>(id);
+
+                return (device.converters || []).map(([fromMimeType, toMimeType], index) => {
+                    return {
+                        id: `${id}-${index}`,
+                        name: device.name,
+                        fromMimeType,
+                        toMimeType,
+                        convert(data, fromMimeType, toMimeType, options?) {
+                            // MediaConverter is injected the plugin's node runtime which may be compiled against an
+                            // older sdk that does not have MediaConverter. use the older convert method instead.
+                            // once BufferConverter is removed, this can be simplified to device.convertMedia.
+                            return (device.convertMedia || device.convert)(data, fromMimeType, toMimeType, options);
+                        },
+                    } as IdBufferConverter;
+                });
+            });
+
+        const converters = [...mediaConverters.flat(), ...bufferConverters];
 
         // builtins should be after system converters. these should not be overriden by system,
         // as it could cause system instability with misconfiguration.
@@ -266,9 +273,7 @@ export abstract class MediaManagerBase implements MediaManager {
         return url.data.toString();
     }
 
-    createMediaObjectRemote<T extends MediaObjectOptions>(data: any | Buffer | Promise<string | Buffer>, mimeType: string, options?: T): MediaObjectRemote & T {
-        if (typeof data === 'string')
-            throw new Error('string is not a valid type. if you intended to send a url, use createMediaObjectFromUrl.');
+    createMediaObjectRemote<T extends MediaObjectCreateOptions>(data: any | Buffer | Promise<string | Buffer>, mimeType: string, options?: T): MediaObjectRemote & T {
         if (!mimeType)
             throw new Error('no mimeType provided');
         if (mimeType === ScryptedMimeTypes.MediaObject)
@@ -278,40 +283,25 @@ export abstract class MediaManagerBase implements MediaManager {
             data = Buffer.from(JSON.stringify(data));
 
         const sourceId = typeof options?.sourceId === 'string' ? options?.sourceId : this.getPluginDeviceId();
-        if (sourceId) {
-            options ||= {} as T;
-            options.sourceId = sourceId;
-        }
+        options ||= {} as T;
+        options.sourceId = sourceId;
 
         return new MediaObject(mimeType, data, options) as MediaObject & T;
     }
 
-    async createFFmpegMediaObject(ffMpegInput: FFmpegInput, options?: MediaObjectOptions): Promise<MediaObjectInterface> {
+    async createFFmpegMediaObject<T extends MediaObjectCreateOptions>(ffMpegInput: FFmpegInput, options?: T): Promise<MediaObjectInterface & T> {
         return this.createMediaObjectRemote(Buffer.from(JSON.stringify(ffMpegInput)), ScryptedMimeTypes.FFmpegInput, options);
     }
 
-    async createMediaObjectFromUrl(data: string, options?: MediaObjectOptions): Promise<MediaObjectInterface> {
+    async createMediaObjectFromUrl<T extends MediaObjectCreateOptions>(data: string, options?: T): Promise<MediaObjectInterface & T> {
         const url = new URL(data);
         const scheme = url.protocol.slice(0, -1);
         const mimeType = ScryptedMimeTypes.SchemePrefix + scheme;
 
-        const sourceId = typeof options?.sourceId === 'string' ? options?.sourceId : this.getPluginDeviceId();
-        class MediaObjectImpl implements MediaObjectRemote {
-            __proxy_props = {
-                mimeType,
-                sourceId,
-            }
-
-            mimeType = mimeType;
-            sourceId = sourceId;
-            async getData(): Promise<Buffer | string> {
-                return Promise.resolve(data);
-            }
-        }
-        return new MediaObjectImpl();
+        return this.createMediaObjectRemote(data, mimeType, options);
     }
 
-    async createMediaObject<T extends MediaObjectOptions>(data: any, mimeType: string, options?: T): Promise<MediaObjectInterface & T> {
+    async createMediaObject<T extends MediaObjectCreateOptions>(data: any, mimeType: string, options?: T): Promise<MediaObjectInterface & T> {
         return this.createMediaObjectRemote(data, mimeType, options);
     }
 
@@ -341,6 +331,49 @@ export abstract class MediaManagerBase implements MediaManager {
         const mediaNode: any = {};
         nodes['mediaObject'] = mediaNode;
         nodes['output'] = {};
+
+        const minimumWeight = .000001;
+
+        for (const toMimeType of mediaObject.toMimeTypes instanceof Array ? mediaObject.toMimeTypes : []) {
+            console.log('biultin toMimeType', toMimeType);
+            const id = `media-${toMimeType}`;
+            converterMap.set(id, {
+                id,
+                name: `MediaObject to ${toMimeType}`,
+                fromMimeType: mediaObject.mimeType,
+                toMimeType,
+                convert: async (data, fromMimeType, toMimeType) => {
+                    return mediaObject.convert(toMimeType);
+                }
+            });
+
+            // connect the media object to the intrinsic target mime type
+            mediaNode[id] = minimumWeight;
+
+            const node: { [edge: string]: number } = nodes[id] = {};
+            const convertedMime = new MimeType(toMimeType);
+
+            // target output matches
+            if (mimeMatches(outputMime, convertedMime) || toMimeType === ScryptedMimeTypes.MediaObject) {
+                node['output'] = minimumWeight;
+            }
+
+            // connect the intrinsic converter to other converters
+            for (const candidate of converters) {
+                try {
+                    const candidateMime = new MimeType(candidate.fromMimeType);
+                    if (!mimeMatches(convertedMime, candidateMime))
+                        continue;
+                    const outputWeight = parseFloat(candidateMime.parameters.get('converter-weight')) || (candidateMime.essence === '*/*' ? 1000 : 1);
+                    const candidateId = candidate.id;
+                    node[candidateId] = outputWeight;
+                }
+                catch (e) {
+                    // console.warn(candidate.name, 'skipping converter due to error', e)
+                }
+            }
+        }
+
         for (const converter of converters) {
             try {
                 const inputMime = new MimeType(converter.fromMimeType);

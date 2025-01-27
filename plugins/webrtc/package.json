@@ -1,6 +1,6 @@
 {
    "name": "@scrypted/webrtc",
-   "version": "0.2.7",
+   "version": "0.2.58",
    "scripts": {
       "scrypted-setup-project": "scrypted-setup-project",
       "prescrypted-setup-project": "scrypted-package-json",
@@ -23,9 +23,8 @@
       "name": "WebRTC Plugin",
       "type": "API",
       "interfaces": [
-         "EngineIOHandler",
          "Settings",
-         "BufferConverter",
+         "MediaConverter",
          "MixinProvider",
          "DeviceProvider"
       ]
@@ -33,10 +32,10 @@
    "dependencies": {
       "@scrypted/common": "file:../../common",
       "@scrypted/sdk": "file:../../sdk",
-      "ip": "^1.1.5"
+      "ip": "^2.0.1"
    },
    "devDependencies": {
-      "@types/ip": "^1.1.0",
-      "@types/node": "^18.11.18"
+      "@types/ip": "^1.1.3",
+      "@types/node": "^22.1.0"
    }
 }

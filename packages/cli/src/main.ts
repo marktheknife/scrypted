@@ -10,6 +10,7 @@ import semver from 'semver';
 import { httpFetch } from '../../../server/src/fetch/http-fetch';
 import { installServe, serveMain } from './service';
 import { connectShell } from './shell';
+import { convertRtspToMp4, printRtspUsage } from './rtsp-file';
 
 if (!semver.gte(process.version, '16.0.0')) {
     throw new Error('"node" version out of date. Please update node to v16 or higher.')
@@ -160,11 +161,11 @@ async function main() {
         const ffmpegInput = await sdk.mediaManager.convertMediaObjectToJSON<FFmpegInput>(await pendingResult, ScryptedMimeTypes.FFmpegInput);
         if (ffmpegInput.url && ffmpegInput.urls?.[0]) {
             const url = new URL(ffmpegInput.url);
-            if (url.hostname === '127.0.0.1' && ffmpegInput.urls?.[0]) {
-                ffmpegInput.inputArguments = ffmpegInput.inputArguments.map(i => i === ffmpegInput.url ? ffmpegInput.urls?.[0] : i);
+            if (url.hostname === '127.0.0.1' && ffmpegInput.urls?.[0] && ffmpegInput.inputArguments) {
+                ffmpegInput.inputArguments = ffmpegInput.inputArguments.map(i => i === ffmpegInput.url && ffmpegInput.urls ? ffmpegInput.urls?.[0] : i);
             }
         }
-        const args = [...ffmpegInput.inputArguments];
+        const args = ffmpegInput.inputArguments ? [...ffmpegInput.inputArguments] : [];
         if (ffmpegInput.h264FilterArguments)
             args.push(...ffmpegInput.h264FilterArguments);
         console.log('ffplay', ...args);
@@ -172,6 +173,14 @@ async function main() {
             stdio: 'inherit',
         });
         sdk.disconnect();
+    }
+    else if (process.argv[2] === 'rtsp') {
+        if (!process.argv[3]) {
+            printRtspUsage();
+            process.exit(1);
+        }
+
+        await convertRtspToMp4(process.argv[3], process.argv[4]);
     }
     else if (process.argv[2] === 'create-cert-json' && process.argv.length === 5) {
         const key = fs.readFileSync(process.argv[3]).toString();

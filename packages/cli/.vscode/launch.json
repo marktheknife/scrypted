@@ -21,7 +21,7 @@
             ],
             "preLaunchTask": "npm: build",
             "args": [
-                "login",
+                "serve",
             ],
             "sourceMaps": true,
             "resolveSourceMapLocations": [

@@ -4,15 +4,21 @@ import fs from 'fs';
 import net from 'net';
 import { join as pathJoin } from 'path';
 import { RpcPeer } from "./rpc";
+import { setupCluster } from "./cluster/cluster-setup";
+import type { ScryptedRuntime } from "./runtime";
 
 export class HttpResponseImpl implements HttpResponse {
-    constructor(public res: Response, public unzippedDir: string, public filesPath: string) {
+    constructor(public scrypted: ScryptedRuntime, public res: Response, public unzippedDir: string, public filesPath: string) {
+        res.on('error', e => {
+            console.warn("Error while sending response from plugin", e);
+        });
     }
 
     [RpcPeer.PROPERTY_PROXY_ONEWAY_METHODS] = [
         'send',
         'sendFile',
         'sendSocket',
+        'sendStream',
     ];
     sent = false;
 
@@ -27,11 +33,7 @@ export class HttpResponseImpl implements HttpResponse {
         }
     }
 
-    send(body: string): void;
-    send(body: string, options: HttpResponseOptions): void;
-    send(body: Buffer): void;
-    send(body: Buffer, options: HttpResponseOptions): void;
-    send(body: any, options?: any) {
+    send(body: string | Buffer, options?: any) {
         this.sent = true;
         if (options?.code)
             this.res.status(options.code);
@@ -40,9 +42,7 @@ export class HttpResponseImpl implements HttpResponse {
         this.res.send(body);
     }
 
-    sendFile(path: string): void;
-    sendFile(path: string, options: HttpResponseOptions): void;
-    sendFile(path: any, options?: HttpResponseOptions) {
+    sendFile(path: string, options?: HttpResponseOptions) {
         this.sent = true;
         if (options?.code)
             this.res.status(options.code);
@@ -74,8 +74,41 @@ export class HttpResponseImpl implements HttpResponse {
         this.#setHeaders(options);
         socket.pipe(this.res);
     }
+
+    sendStream(stream: AsyncGenerator<Buffer, void>, options?: HttpResponseOptions): void {
+        this.sent = true;
+        if (options?.code)
+            this.res.status(options.code);
+        this.#setHeaders(options);
+        const peer = new RpcPeer("server-stream", "client-stream", (message, reject, serializationContext) => {
+            console.warn('unexpected message to client-stream', message);
+        });
+        const clusterSetup = setupCluster(peer);
+
+        (async () => {
+            try {
+                await clusterSetup.initializeCluster({
+                    clusterId: this.scrypted.clusterId,
+                    clusterWorkerId: this.scrypted.serverClusterWorkerId,
+                    clusterSecret: this.scrypted.clusterSecret,
+                });
+                stream = await clusterSetup.connectRPCObject(stream);
+
+                for await (const chunk of stream) {
+                    this.res.write(chunk);
+                }
+                this.res.end();
+            }
+            catch (e) {
+                this.res.destroy(e);
+            }
+            finally {
+                peer.kill();
+            }
+        })();
+    }
 }
 
-export function createResponseInterface(res: Response, unzippedDir: string, filesPath: string): HttpResponseImpl {
-    return new HttpResponseImpl(res, unzippedDir, filesPath);
+export function createResponseInterface(scrypted: ScryptedRuntime, res: Response, unzippedDir: string, filesPath: string): HttpResponseImpl {
+    return new HttpResponseImpl(scrypted, res, unzippedDir, filesPath);
 }

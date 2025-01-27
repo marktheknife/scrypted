@@ -33,13 +33,20 @@
       "runtime": "python",
       "type": "API",
       "interfaces": [
+         "DeviceProvider",
          "Settings",
+         "ClusterForkInterface",
          "ObjectDetection",
          "ObjectDetectionPreview"
-      ]
+      ],
+      "labels": {
+         "require": [
+            "@scrypted/openvino"
+         ]
+      }
    },
    "devDependencies": {
       "@scrypted/sdk": "file:../../sdk"
    },
-   "version": "0.1.51"
+   "version": "0.1.153"
 }

@@ -1,14 +1,13 @@
 import { cloneDeep } from "@scrypted/common/src/clone-deep";
-import { ParserOptions, ParserSession, setupActivityTimer } from "@scrypted/common/src/ffmpeg-rebroadcast";
 import { read16BELengthLoop } from "@scrypted/common/src/read-stream";
-import { findH264NaluType, H264_NAL_TYPE_SPS, RTSP_FRAME_MAGIC } from "@scrypted/common/src/rtsp-server";
+import { H264_NAL_TYPE_SPS, RTSP_FRAME_MAGIC, findH264NaluType } from "@scrypted/common/src/rtsp-server";
 import { parseSdp } from "@scrypted/common/src/sdp-utils";
-import { sleep } from "@scrypted/common/src/sleep";
 import { StreamChunk } from "@scrypted/common/src/stream-parser";
 import { MediaStreamOptions, ResponseMediaStreamOptions } from "@scrypted/sdk";
 import { parse as spsParse } from "h264-sps-parser";
 import net from 'net';
 import { EventEmitter, Readable } from "stream";
+import { ParserSession, setupActivityTimer } from "./ffmpeg-rebroadcast";
 import { getSpsResolution } from "./sps-resolution";
 
 export function negotiateMediaStream(sdp: string, mediaStreamOptions: MediaStreamOptions, inputVideoCodec: string, inputAudioCodec: string, requestMediaStream: MediaStreamOptions) {
@@ -70,7 +69,7 @@ export function startRFC4571Parser(console: Console, socket: Readable, sdp: stri
     let isActive = true;
     const events = new EventEmitter();
     // need this to prevent kill from throwing due to uncaught Error during cleanup
-    events.on('error', e => console.error('rebroadcast error', e));
+    events.on('error', () => {});
 
     const parsedSdp = parseSdp(sdp);
     const audioSection = parsedSdp.msections.find(msection => msection.type === 'audio');
@@ -192,19 +191,14 @@ export function startRFC4571Parser(console: Console, socket: Readable, sdp: stri
 
     return {
         start,
-        sdp: Promise.resolve([Buffer.from(sdp)]),
-        inputAudioCodec,
-        inputVideoCodec,
-        get inputVideoResolution() {
-            return inputVideoResolution;
-        },
+        sdp: Promise.resolve(sdp),
         get isActive() { return isActive },
         kill(error?: Error) {
             kill(error);
         },
         killed,
         resetActivityTimer,
-        negotiateMediaStream: (requestMediaStream) => {
+        negotiateMediaStream: (requestMediaStream,inputVideoCodec, inputAudioCodec) => {
             return negotiateMediaStream(sdp, mediaStreamOptions, inputVideoCodec, inputAudioCodec, requestMediaStream);
         },
         emit(container: 'rtsp', chunk: StreamChunk) {

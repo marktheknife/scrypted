@@ -1,4 +1,4 @@
-import { HttpFetchOptions, HttpFetchResponseType, checkStatus, fetcher, getFetchMethod, setDefaultHttpFetchAccept } from '../../../server/src/fetch';
+import { HttpFetchOptions, HttpFetchResponseType, checkStatus, createHeadersArray, fetcher, getFetchMethod, hasHeader, setDefaultHttpFetchAccept, setHeader } from '../../../server/src/fetch';
 
 export interface AuthFetchCredentialState {
     username: string;
@@ -70,36 +70,54 @@ async function getAuth(options: AuthFetchOptions, url: string | URL, method: str
 
 export function createAuthFetch<B, M>(
     h: fetcher<B, M>,
-    parser: (body: M, responseType: HttpFetchResponseType) => Promise<any>
+    parser: (body: M, responseType: HttpFetchResponseType | undefined) => Promise<any>
 ) {
     const authHttpFetch = async <T extends HttpFetchOptions<B>>(options: T & AuthFetchOptions): ReturnType<typeof h<T>> => {
         const method = getFetchMethod(options);
-        const headers = new Headers(options.headers);
+        const headers = createHeadersArray(options.headers);
         options.headers = headers;
         setDefaultHttpFetchAccept(headers, options.responseType);
 
         const initialHeader = await getAuth(options, options.url, method);
         // try to provide an authorization if a session exists, but don't override Authorization if provided already.
         // 401 will trigger a proper auth.
-        if (initialHeader && !headers.has('Authorization'))
-            headers.set('Authorization', initialHeader);
+        if (initialHeader && !hasHeader(headers, 'Authorization'))
+            setHeader(headers, 'Authorization', initialHeader);
+
+
+        const controller = new AbortController();
+        options.signal?.addEventListener('abort', () => controller.abort(options.signal?.reason));
 
         const initialResponse = await h({
             ...options,
-            ignoreStatusCode: true,
+            signal: controller.signal,
+            // need to intercept the status code to check for 401.
+            // all other status codes will be handled according to the initial request options.
+            checkStatusCode(statusCode) {
+                // can handle a 401 if an credential is provided.
+                // however, not providing a credential is also valid, and should
+                // fall through to the normal response handling which may be interested
+                // in the 401 response.
+                if (statusCode === 401 && options.credential)
+                    return true;
+                if (options?.checkStatusCode === undefined || options?.checkStatusCode) {
+                    const checker = typeof options?.checkStatusCode === 'function' ? options.checkStatusCode : checkStatus;
+                    return checker(statusCode);
+                }
+                return true;
+            },
             responseType: 'readable',
         });
 
-        if (initialResponse.statusCode !== 401 || !options.credential) {
-            if (!options?.ignoreStatusCode)
-                checkStatus(initialResponse.statusCode);
+        // if it's not a 401, just return the response.
+        if (initialResponse.statusCode !== 401) {
             return {
                 ...initialResponse,
                 body: await parser(initialResponse.body, options.responseType),
             };
         }
 
-        let authenticateHeaders: string | string[] = initialResponse.headers.get('www-authenticate');
+        let authenticateHeaders: string | string[] | null = initialResponse.headers.get('www-authenticate');
         if (!authenticateHeaders)
             throw new Error('Did not find WWW-Authenticate header.');
 
@@ -126,7 +144,7 @@ export function createAuthFetch<B, M>(
 
         const header = await getAuth(options, options.url, method);
         if (header)
-            headers.set('Authorization', header);
+            setHeader(headers, 'Authorization', header);
 
         return h(options);
     }

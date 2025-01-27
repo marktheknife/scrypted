@@ -2,7 +2,7 @@ import type { ScryptedDeviceBase } from "@scrypted/sdk";
 import type { MqttClient, MqttEvent, MqttSubscriptions } from "./mqtt-client";
 
 declare const device: ScryptedDeviceBase;
-declare const mqtt: MqttClient;
+export declare const mqtt: MqttClient;
 
 export function createSensor(options: {
     type: string,

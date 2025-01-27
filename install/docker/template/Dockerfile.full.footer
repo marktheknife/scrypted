@@ -3,8 +3,17 @@
 ################################################################
 FROM header as base
 
-# intel opencl gpu for openvino
+# vulkan
+RUN apt -y install libvulkan1
+
+# intel opencl for openvino
 RUN curl https://raw.githubusercontent.com/koush/scrypted/main/install/docker/install-intel-graphics.sh | bash
+
+# NPU driver will SIGILL on openvino prior to 2024.5.0
+RUN curl https://raw.githubusercontent.com/koush/scrypted/main/install/docker/install-intel-npu.sh | bash
+
+# amd opencl
+RUN curl https://raw.githubusercontent.com/koush/scrypted/main/install/docker/install-amd-graphics.sh | bash
 
 # python 3.9 from ppa.
 # 3.9 is the version with prebuilt support for tensorflow lite
@@ -17,8 +26,8 @@ RUN add-apt-repository -y ppa:deadsnakes/ppa && \
 # allow pip to install to system
 RUN rm -f /usr/lib/python**/EXTERNALLY-MANAGED
 
-RUN python3.9 -m pip install --upgrade pip
-RUN python3.9 -m pip install debugpy typing_extensions psutil
+# RUN python3.9 -m pip install --upgrade pip
+RUN python3.9 -m pip install debugpy
 
 # Coral Edge TPU
 # https://coral.ai/docs/accelerator/get-started/#runtime-on-linux
@@ -26,13 +35,20 @@ RUN echo "deb https://packages.cloud.google.com/apt coral-edgetpu-stable main" |
 RUN curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | apt-key add -
 RUN apt-get -y update && apt-get -y install libedgetpu1-std
 
+# set default shell to bash
+RUN chsh -s /bin/bash
+ENV SHELL="/bin/bash"
+
 ENV SCRYPTED_INSTALL_ENVIRONMENT="docker"
 ENV SCRYPTED_CAN_RESTART="true"
 ENV SCRYPTED_VOLUME="/server/volume"
 ENV SCRYPTED_INSTALL_PATH="/server"
 
-RUN test -f "/usr/bin/ffmpeg"
+RUN test -f "/usr/bin/ffmpeg" && test -f "/usr/bin/python3" && test -f "/usr/bin/python3.9" && test -f "/usr/bin/python3.12"
 ENV SCRYPTED_FFMPEG_PATH="/usr/bin/ffmpeg"
+ENV SCRYPTED_PYTHON_PATH="/usr/bin/python3"
+ENV SCRYPTED_PYTHON39_PATH="/usr/bin/python3.9"
+ENV SCRYPTED_PYTHON312_PATH="/usr/bin/python3.12"
 
 ENV SCRYPTED_DOCKER_FLAVOR="full"
 

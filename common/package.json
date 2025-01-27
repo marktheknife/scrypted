@@ -12,12 +12,12 @@
   "license": "ISC",
   "dependencies": {
     "@scrypted/sdk": "file:../sdk",
-    "@scrypted/server": "file:../server",
     "http-auth-utils": "^5.0.1",
-    "typescript": "^5.3.3"
+    "typescript": "^5.5.3"
   },
   "devDependencies": {
     "@types/node": "^20.11.0",
+    "monaco-editor": "^0.50.0",
     "ts-node": "^10.9.2"
   }
 }

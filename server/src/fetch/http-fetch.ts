@@ -1,9 +1,9 @@
 import type events from 'events';
-import type stream from 'stream';
 import type followRedirects from 'follow-redirects';
 import type { IncomingMessage } from 'http';
+import type stream from 'stream';
 import type { Readable } from 'stream';
-import { HttpFetchBufferOptions, HttpFetchJsonOptions, HttpFetchOptions, HttpFetchReadableOptions, HttpFetchResponse, HttpFetchResponseType, HttpFetchTextOptions, checkStatus, createStringOrBufferBody, getFetchMethod, setDefaultHttpFetchAccept } from '.';
+import { HttpFetchBufferOptions, HttpFetchJsonOptions, HttpFetchOptions, HttpFetchReadableOptions, HttpFetchResponse, HttpFetchResponseType, HttpFetchTextOptions, checkStatus, createHeadersArray, createStringOrBufferBody, getFetchMethod, setDefaultHttpFetchAccept } from '.';
 export type { HttpFetchBufferOptions, HttpFetchJsonOptions, HttpFetchOptions, HttpFetchReadableOptions, HttpFetchResponse, HttpFetchResponseType, HttpFetchTextOptions, checkStatus, setDefaultHttpFetchAccept } from '.';
 
 async function readMessageBuffer(response: IncomingMessage) {
@@ -41,7 +41,7 @@ const StreamParser: FetchParser<IncomingMessage> = {
     }
 }
 
-export function getHttpFetchParser(responseType: HttpFetchResponseType) {
+export function getHttpFetchParser(responseType: HttpFetchResponseType | undefined) {
     switch (responseType) {
         case 'json':
             return JSONParser;
@@ -53,7 +53,7 @@ export function getHttpFetchParser(responseType: HttpFetchResponseType) {
     return BufferParser;
 }
 
-export function httpFetchParseIncomingMessage(readable: IncomingMessage, responseType: HttpFetchResponseType) {
+export function httpFetchParseIncomingMessage(readable: IncomingMessage, responseType: HttpFetchResponseType | undefined) {
     return getHttpFetchParser(responseType).parse(readable);
 }
 
@@ -64,7 +64,7 @@ export async function httpFetch<T extends HttpFetchOptions<Readable>>(options: T
     : T extends HttpFetchReadableOptions<Readable> ? IncomingMessage
     : T extends HttpFetchJsonOptions<Readable> ? any : Buffer
 >> {
-    const headers = new Headers(options.headers);
+    const headers = createHeadersArray(options.headers);
     setDefaultHttpFetchAccept(headers, options.responseType);
 
     const { once } = require('events') as typeof events;
@@ -83,6 +83,18 @@ export async function httpFetch<T extends HttpFetchOptions<Readable>>(options: T
         body = newBody;
     }
 
+    let controller: AbortController | undefined;
+    let timeout: NodeJS.Timeout;
+    if (options.timeout) {
+        controller = new AbortController();
+        timeout = setTimeout(() => controller!.abort(), options.timeout);
+
+        options.signal?.addEventListener('abort', () => controller!.abort(options.signal?.reason));
+    }
+
+    const signal = controller?.signal || options.signal;
+    signal?.addEventListener('abort', () => request.destroy(new Error(options.signal?.reason || 'abort')));
+
     const nodeHeaders: Record<string, string[]> = {};
     for (const [k, v] of headers) {
         if (nodeHeaders[k]) {
@@ -98,6 +110,7 @@ export async function httpFetch<T extends HttpFetchOptions<Readable>>(options: T
         rejectUnauthorized: options.rejectUnauthorized,
         family: options.family,
         headers: nodeHeaders,
+        signal,
         timeout: options.timeout,
     });
 
@@ -105,57 +118,38 @@ export async function httpFetch<T extends HttpFetchOptions<Readable>>(options: T
         body.pipe(request);
     else
         request.end();
-    const [response] = await once(request, 'response') as [IncomingMessage];
 
-    if (!options?.ignoreStatusCode) {
-        try {
-            checkStatus(response.statusCode);
+    try {
+        const [response] = await once(request, 'response') as [IncomingMessage];
+
+
+        if (options?.checkStatusCode === undefined || options?.checkStatusCode) {
+            try {
+                const checker = typeof options?.checkStatusCode === 'function' ? options.checkStatusCode : checkStatus;
+                if (!response.statusCode || !checker(response.statusCode))
+                    throw new Error(`http response statusCode ${response.statusCode}`);
+            }
+            catch (e) {
+                readMessageBuffer(response).catch(() => { });
+                throw e;
+            }
         }
-        catch (e) {
-            readMessageBuffer(response).catch(() => { });
-            throw e;
+
+        const incomingHeaders = new Headers();
+        for (const [k, v] of Object.entries(response.headers)) {
+            for (const vv of (typeof v === 'string' ? [v] : v!)) {
+                incomingHeaders.append(k, vv)
+            }
         }
+
+        return {
+            statusCode: response.statusCode!,
+            headers: incomingHeaders,
+            body: await httpFetchParseIncomingMessage(response, options.responseType),
+        };
     }
-
-    const incomingHeaders = new Headers();
-    for (const [k, v] of Object.entries(response.headers)) {
-        for (const vv of (typeof v === 'string' ? [v] : v)) {
-            incomingHeaders.append(k, vv)
-        }
+    finally {
+        clearTimeout(timeout!);
     }
-
-    return {
-        statusCode: response.statusCode,
-        headers: incomingHeaders,
-        body: await httpFetchParseIncomingMessage(response, options.responseType),
-    };
 }
 
-function ensureType<T>(v: T) {
-}
-
-async function test() {
-    const a = await httpFetch({
-        url: 'http://example.com',
-    });
-
-    ensureType<Buffer>(a.body);
-
-    const b = await httpFetch({
-        url: 'http://example.com',
-        responseType: 'json',
-    });
-    ensureType<any>(b.body);
-
-    const c = await httpFetch({
-        url: 'http://example.com',
-        responseType: 'readable',
-    });
-    ensureType<IncomingMessage>(c.body);
-
-    const d = await httpFetch({
-        url: 'http://example.com',
-        responseType: 'buffer',
-    });
-    ensureType<Buffer>(d.body);
-}

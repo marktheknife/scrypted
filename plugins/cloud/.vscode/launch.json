@@ -5,6 +5,20 @@
     "version": "0.2.0",
     "configurations": [
         {
+            "name": "Test Cloudflared",
+            "type": "node",
+            "request": "launch",
+            "args": [
+                "${workspaceFolder}/test/test-cloudflared.ts"
+            ],
+            "runtimeArgs": [
+                "-r",
+                "ts-node/register"
+            ],
+            "cwd": "${workspaceRoot}",
+            "internalConsoleOptions": "openOnSessionStart"
+        },
+        {
             "name": "Scrypted Debugger",
             "address": "${config:scrypted.debugHost}",
             "port": 10081,
@@ -16,7 +30,7 @@
             "sourceMaps": true,
             "localRoot": "${workspaceFolder}/out",
             "remoteRoot": "/plugin/",
-            "type": "pwa-node"
+            "type": "node"
         }
     ]
 }

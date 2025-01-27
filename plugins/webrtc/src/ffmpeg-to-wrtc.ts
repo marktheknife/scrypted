@@ -3,7 +3,7 @@ import { MediaStreamTrack, PeerConfig, RTCPeerConnection, RTCRtpCodecParameters,
 import { Deferred } from "@scrypted/common/src/deferred";
 import sdk, { FFmpegInput, FFmpegTranscodeStream, Intercom, MediaObject, MediaStreamDestination, MediaStreamFeedback, RequestMediaStream, RTCAVSignalingSetup, RTCConnectionManagement, RTCInputMediaObjectTrack, RTCOutputMediaObjectTrack, RTCSignalingOptions, RTCSignalingSession, ScryptedDevice, ScryptedMimeTypes } from "@scrypted/sdk";
 import { ScryptedSessionControl } from "./session-control";
-import { requiredAudioCodecs, requiredVideoCodec } from "./webrtc-required-codecs";
+import { opusAudioCodecOnly, requiredAudioCodecs, requiredVideoCodec } from "./webrtc-required-codecs";
 import { logIsLocalIceTransport } from "./werift-util";
 
 import { addVideoFilterArguments } from "@scrypted/common/src/ffmpeg-helpers";
@@ -15,8 +15,6 @@ import { logConnectionState, waitClosed, waitConnected, waitIceConnected } from 
 import { RtpCodecCopy, RtpTrack, RtpTracks, startRtpForwarderProcess } from "./rtp-forwarders";
 import { getAudioCodec, getFFmpegRtpAudioOutputArguments } from "./webrtc-required-codecs";
 import { WeriftSignalingSession } from "./werift-signaling-session";
-
-export const RTC_BRIDGE_NATIVE_ID = 'rtc-bridge';
 
 function getDebugModeH264EncoderArgs() {
     return [
@@ -42,14 +40,14 @@ const fullResolutionAllowList = [
 
 export async function createTrackForwarder(options: {
     timeStart: number,
-    isLocalNetwork: boolean, destinationId: string, ipv4: boolean,
+    isLocalNetwork: boolean, destinationId: string, ipv4: boolean, type: string,
     requestMediaStream: RequestMediaStream,
     videoTransceiver: RTCRtpTransceiver, audioTransceiver: RTCRtpTransceiver,
     maximumCompatibilityMode: boolean, clientOptions: RTCSignalingOptions,
 }) {
     const {
         timeStart,
-        isLocalNetwork, destinationId,
+        isLocalNetwork, destinationId, type,
         requestMediaStream,
         videoTransceiver, audioTransceiver,
         maximumCompatibilityMode,
@@ -100,7 +98,7 @@ export async function createTrackForwarder(options: {
         });
     }
 
-    const console = sdk.deviceManager.getMixinConsole(mo.sourceId, RTC_BRIDGE_NATIVE_ID);
+    const console = sdk.deviceManager.getMixinConsole(mo.sourceId);
     const ffmpegInput = await sdk.mediaManager.convertMediaObjectToJSON<FFmpegInput>(mo, ScryptedMimeTypes.FFmpegInput);
     const { mediaStreamOptions } = ffmpegInput;
 
@@ -216,6 +214,9 @@ export async function createTrackForwarder(options: {
         }
     }
 
+    if (mediaStreamFeedback)
+        needPacketization = false;
+
     let opusRepacketizer: OpusRepacketizer;
     let lastPacketTs: number = 0;
     const audioRtpTrack: RtpTrack = {
@@ -279,7 +280,21 @@ export async function createTrackForwarder(options: {
     // better knowledge of network capabilities, and also mirrors
     // from my cursory research into ipv6, the MTU is no lesser than ipv4, in fact
     // the min mtu is larger.
-    const videoPacketSize = 1378;
+    // 2024/06/20: webrtc MTU is typically 1200 as seen in chrome:
+    // https://groups.google.com/g/discuss-webrtc/c/gH5ysR3SoZI
+    // https://bloggeek.me/webrtcglossary/mtu-size/
+    // apparently this is due to guaranteeing reliability for weird networks.
+    // most of these networks can be correctly configured with an increased MTU (wireguard, tailscale),
+    // but others can not, like iCloud Private Relay.
+    // iCloud Private Relay ends up coming through TURN, as do many other restrictive networks.
+    // so when a turn (aka relay) server is used, a smaller MTU must be used. Otherwise optimistically use
+    // the normal/larger default.
+    // After a bit of fiddling with iCloud Private Relay, 1246 was arrived at as the optimal value.
+    // 2024/06/28: Setting to 1200 due to FirstNet.
+    // After further user testing, FirstNet MTU seems be around 1200, though advertised at 1342.
+    // So using Chrome's 1200 seems best, though crappy.
+    // https://iotdevices.att.com/att-iot/FirstNetMTU.aspx
+    const videoPacketSize = 1200;
     let h264Repacketizer: H264Repacketizer;
     let spsPps: ReturnType<typeof getSpsPps>;
 
@@ -406,6 +421,7 @@ class WebRTCTrack implements RTCOutputMediaObjectTrack, RTCInputMediaObjectTrack
 
     constructor(public connectionManagement: WebRTCConnectionManagement, public video: RTCRtpTransceiver, public audio: RTCRtpTransceiver, intercom: Intercom) {
         this.control = new ScryptedSessionControl(intercom, audio);
+        this.connectionManagement.activeTracks.add(this);
     }
 
     async onStop(): Promise<void> {
@@ -465,6 +481,7 @@ export class WebRTCConnectionManagement implements RTCConnectionManagement {
     closed = false;
 
     constructor(public console: Console, public clientSession: RTCSignalingSession,
+        public requireOpus: boolean,
         public maximumCompatibilityMode: boolean,
         public clientOptions: RTCSignalingOptions,
         public options: {
@@ -478,7 +495,7 @@ export class WebRTCConnectionManagement implements RTCConnectionManagement {
             // the cameras and alexa targets will also provide externally reachable addresses.
             codecs: {
                 audio: [
-                    ...requiredAudioCodecs,
+                    ...(requireOpus ? opusAudioCodecOnly : requiredAudioCodecs),
                 ],
                 video: [
                     requiredVideoCodec,
@@ -623,7 +640,7 @@ export class WebRTCConnectionManagement implements RTCConnectionManagement {
 
     async close(): Promise<void> {
         for (const track of this.activeTracks) {
-            track.cleanup(true);
+            track.cleanup(false);
         }
         this.activeTracks.clear();
         this.pc.close();
@@ -644,6 +661,7 @@ export async function createRTCPeerConnectionSink(
     console: Console,
     intercom: ScryptedDevice & Intercom,
     mo: MediaObject,
+    requireOpus: boolean,
     maximumCompatibilityMode: boolean,
     configuration: RTCConfiguration,
     weriftConfiguration: Partial<PeerConfig>,
@@ -652,7 +670,7 @@ export async function createRTCPeerConnectionSink(
     const clientOptions = await legacyGetSignalingSessionOptions(clientSignalingSession);
     // console.log('remote options', clientOptions);
 
-    const connection = new WebRTCConnectionManagement(console, clientSignalingSession, maximumCompatibilityMode, clientOptions, {
+    const connection = new WebRTCConnectionManagement(console, clientSignalingSession, requireOpus, maximumCompatibilityMode, clientOptions, {
         configuration,
         weriftConfiguration,
     });
@@ -662,7 +680,7 @@ export async function createRTCPeerConnectionSink(
     });
 
     track.control.killed.promise.then(() => {
-        track.cleanup(true);
+        track.cleanup(false);
         connection.pc.close();
     });
 

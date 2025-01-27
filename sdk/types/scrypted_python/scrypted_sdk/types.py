@@ -1,10 +1,10 @@
 from __future__ import annotations
 from enum import Enum
 try:
-    from typing import TypedDict
+    from typing import TypedDict, Mapping
 except:
-    from typing_extensions import TypedDict
-from typing import Union, Any
+    from typing_extensions import TypedDict, Mapping
+from typing import Union, Any, AsyncGenerator
 
 from .other import *
 
@@ -64,12 +64,15 @@ class MediaPlayerState(str, Enum):
 class PanTiltZoomMovement(str, Enum):
 
     Absolute = "Absolute"
+    Continuous = "Continuous"
+    Home = "Home"
+    Preset = "Preset"
     Relative = "Relative"
 
 class ScryptedDeviceType(str, Enum):
 
-    API = "API"
     AirPurifier = "AirPurifier"
+    API = "API"
     Automation = "Automation"
     Builtin = "Builtin"
     Camera = "Camera"
@@ -109,13 +112,16 @@ class ScryptedInterface(str, Enum):
     AirQualitySensor = "AirQualitySensor"
     AmbientLightSensor = "AmbientLightSensor"
     AudioSensor = "AudioSensor"
+    AudioVolumeControl = "AudioVolumeControl"
     Battery = "Battery"
     BinarySensor = "BinarySensor"
     Brightness = "Brightness"
     BufferConverter = "BufferConverter"
-    CO2Sensor = "CO2Sensor"
+    Buttons = "Buttons"
     Camera = "Camera"
     Charger = "Charger"
+    ClusterForkInterface = "ClusterForkInterface"
+    CO2Sensor = "CO2Sensor"
     ColorSettingHsv = "ColorSettingHsv"
     ColorSettingRgb = "ColorSettingRgb"
     ColorSettingTemperature = "ColorSettingTemperature"
@@ -138,12 +144,13 @@ class ScryptedInterface(str, Enum):
     LauncherApplication = "LauncherApplication"
     Lock = "Lock"
     LuminanceSensor = "LuminanceSensor"
+    MediaConverter = "MediaConverter"
     MediaPlayer = "MediaPlayer"
     Microphone = "Microphone"
     MixinProvider = "MixinProvider"
     MotionSensor = "MotionSensor"
-    NOXSensor = "NOXSensor"
     Notifier = "Notifier"
+    NOXSensor = "NOXSensor"
     OauthClient = "OauthClient"
     ObjectDetection = "ObjectDetection"
     ObjectDetectionGenerator = "ObjectDetectionGenerator"
@@ -151,26 +158,31 @@ class ScryptedInterface(str, Enum):
     ObjectDetector = "ObjectDetector"
     ObjectTracker = "ObjectTracker"
     OccupancySensor = "OccupancySensor"
-    OnOff = "OnOff"
     Online = "Online"
-    PM10Sensor = "PM10Sensor"
-    PM25Sensor = "PM25Sensor"
+    OnOff = "OnOff"
     PanTiltZoom = "PanTiltZoom"
     PasswordStore = "PasswordStore"
     Pause = "Pause"
+    PM10Sensor = "PM10Sensor"
+    PM25Sensor = "PM25Sensor"
     PositionSensor = "PositionSensor"
     PowerSensor = "PowerSensor"
+    PressButtons = "PressButtons"
     Program = "Program"
     PushHandler = "PushHandler"
-    RTCSignalingChannel = "RTCSignalingChannel"
-    RTCSignalingClient = "RTCSignalingClient"
     Readme = "Readme"
     Reboot = "Reboot"
     Refresh = "Refresh"
+    RTCSignalingChannel = "RTCSignalingChannel"
+    RTCSignalingClient = "RTCSignalingClient"
     Scene = "Scene"
     Scriptable = "Scriptable"
     ScryptedDevice = "ScryptedDevice"
+    ScryptedDeviceCreator = "ScryptedDeviceCreator"
     ScryptedPlugin = "ScryptedPlugin"
+    ScryptedPluginRuntime = "ScryptedPluginRuntime"
+    ScryptedSettings = "ScryptedSettings"
+    ScryptedSystemDevice = "ScryptedSystemDevice"
     ScryptedUser = "ScryptedUser"
     SecuritySystem = "SecuritySystem"
     Settings = "Settings"
@@ -179,14 +191,17 @@ class ScryptedInterface(str, Enum):
     TamperSensor = "TamperSensor"
     TemperatureSetting = "TemperatureSetting"
     Thermometer = "Thermometer"
+    TTY = "TTY"
+    TTYSettings = "TTYSettings"
     UltravioletSensor = "UltravioletSensor"
-    VOCSensor = "VOCSensor"
     VideoCamera = "VideoCamera"
     VideoCameraConfiguration = "VideoCameraConfiguration"
+    VideoCameraMask = "VideoCameraMask"
     VideoClips = "VideoClips"
     VideoFrameGenerator = "VideoFrameGenerator"
     VideoRecorder = "VideoRecorder"
     VideoRecorderManagement = "VideoRecorderManagement"
+    VOCSensor = "VOCSensor"
 
 class ScryptedMimeTypes(str, Enum):
 
@@ -199,12 +214,13 @@ class ScryptedMimeTypes(str, Enum):
     MediaStreamFeedback = "x-scrypted/x-media-stream-feedback"
     MediaStreamUrl = "text/x-media-url"
     PushEndpoint = "text/x-push-endpoint"
+    RequestMediaObject = "x-scrypted/x-scrypted-request-media-object"
+    RequestMediaStream = "x-scrypted/x-scrypted-request-stream"
     RTCConnectionManagement = "x-scrypted/x-scrypted-rtc-connection-management"
     RTCSignalingChannel = "x-scrypted/x-scrypted-rtc-signaling-channel"
     RTCSignalingSession = "x-scrypted/x-scrypted-rtc-signaling-session"
-    RequestMediaObject = "x-scrypted/x-scrypted-request-media-object"
-    RequestMediaStream = "x-scrypted/x-scrypted-request-stream"
     SchemePrefix = "x-scrypted/x-scrypted-scheme-"
+    ServerId = "text/x-server-id"
     Url = "text/x-uri"
 
 class SecuritySystemMode(str, Enum):
@@ -254,7 +270,7 @@ class H264Info(TypedDict):
 class ImageOptions(TypedDict):
 
     crop: Any
-    format: ImageFormat
+    format: str
     resize: Any
 
 class ObjectDetectionHistory(TypedDict):
@@ -285,10 +301,23 @@ class AudioStreamOptions(TypedDict):
     profile: str
     sampleRate: float
 
+class ClusterFork(TypedDict):
+
+    clusterWorkerId: str
+    id: str
+    labels: Any
+    runtime: str
+
 class HttpResponseOptions(TypedDict):
 
     code: float
     headers: object
+
+class NotificationAction(TypedDict):
+
+    action: str
+    icon: str
+    title: str
 
 class ObjectDetectionResult(TypedDict):
 
@@ -297,9 +326,11 @@ class ObjectDetectionResult(TypedDict):
     clipPaths: list[ClipPath]  # The detection clip paths that outlines various features or segments, like traced facial features.
     cost: float  # The certainty that this is correct tracked object.
     descriptor: str  # A base64 encoded Float32Array that represents the vector descriptor of the detection. Can be used to compute euclidian distance to determine similarity.
+    embedding: str  # Base64 encoded embedding float32 vector.
     history: ObjectDetectionHistory
     id: str  # The id of the tracked object.
     label: str  # The label of the object, if it was recognized as a familiar object (person, pet, etc).
+    labelScore: float  # The score of the label.
     landmarks: list[Point]  # The detection landmarks, like key points in a face landmarks.
     movement: Union[ObjectDetectionHistory, Any]  # Movement history will track the first/last time this object was moving.
     resources: VideoResource
@@ -317,6 +348,11 @@ class PictureDimensions(TypedDict):
 
     height: float
     width: float
+
+class PrivacyMask(TypedDict):
+
+    name: str
+    points: list[Point]
 
 class RequestMediaStreamAdaptiveOptions(TypedDict):
 
@@ -336,11 +372,11 @@ class RequestVideoStreamOptions(TypedDict):
     fps: float
     h264Info: H264Info
     height: float
-    idrIntervalMillis: float  # Key Frame interval in milliseconds.
     keyframeInterval: float  # Key Frame interval in frames.
     maxBitrate: float
     minBitrate: float
     profile: str
+    quality: float
     width: float
 
 class ScryptedDeviceAccessControl(TypedDict):
@@ -356,6 +392,29 @@ class VideoResource(TypedDict):
     thumbnail: Resource
     video: Resource
 
+class VideoStreamConfiguration(TypedDict):
+
+    bitrate: float
+    bitrateControl: Any | Any
+    bitrateControls: list[str]
+    bitrateRange: tuple[float, float]
+    codec: str
+    codecs: list[str]
+    fps: float
+    fpsRange: tuple[float, float]
+    h264Info: H264Info
+    height: float
+    keyframeInterval: float  # Key Frame interval in frames.
+    keyframeIntervalRange: tuple[float, float]
+    maxBitrate: float
+    minBitrate: float
+    profile: str
+    profiles: list[str]
+    quality: float
+    qualityRange: tuple[float, float]
+    resolutions: list[tuple[float, float]]
+    width: float
+
 class VideoStreamOptions(TypedDict):
 
     bitrate: float
@@ -364,17 +423,12 @@ class VideoStreamOptions(TypedDict):
     fps: float
     h264Info: H264Info
     height: float
-    idrIntervalMillis: float  # Key Frame interval in milliseconds.
     keyframeInterval: float  # Key Frame interval in frames.
     maxBitrate: float
     minBitrate: float
     profile: str
+    quality: float
     width: float
-
-class ImageFormat(TypedDict):
-
-    pass
-
 
 class MediaStreamDestination(TypedDict):
 
@@ -402,6 +456,25 @@ class AirPurifierState(TypedDict):
     mode: AirPurifierMode
     speed: float
     status: AirPurifierStatus
+
+class AudioVolumes(TypedDict):
+
+    pass
+
+
+class ClusterForkInterfaceOptions(TypedDict):
+
+    clusterWorkerId: str  # The id of the cluster worker id that will execute this fork.
+    id: str  # The id of the device that is associated with this fork.
+    nativeId: str  # The native id of the mixin that is associated with this fork.
+
+class ClusterWorker(TypedDict):
+
+    forks: list[ClusterFork]
+    id: str
+    labels: list[str]
+    mode: Any | Any
+    name: str
 
 class ColorHsv(TypedDict):
     """Represents an HSV color value component."""
@@ -442,6 +515,7 @@ class DeviceCreatorSettings(TypedDict):
 
 class DeviceInformation(TypedDict):
 
+    deeplink: Any
     firmware: str
     ip: str
     mac: str
@@ -488,18 +562,6 @@ class EventListenerOptions(TypedDict):
     mixinId: str  # The EventListener will listen to events and property changes from a device or mixin that is suppressed by a mixin.
     watch: bool  # This EventListener will passively watch for events, and not initiate polling.
 
-class FFmpegInput(TypedDict):
-
-    container: str
-    destinationVideoBitrate: float
-    h264EncoderArguments: list[str]
-    h264FilterArguments: list[str]
-    inputArguments: list[str]
-    mediaStreamOptions: ResponseMediaStreamOptions
-    url: str  # The media url for this FFmpegInput.
-    urls: list[str]  # Alternate media urls for this FFmpegInput.
-    videoDecoderArguments: list[str]
-
 class FanState(TypedDict):
 
     counterClockwise: bool
@@ -516,6 +578,20 @@ class FanStatus(TypedDict):
     mode: FanMode
     speed: float  # Rotations per minute, if available, otherwise 0 or 1.
     swing: bool
+
+class FFmpegInput(TypedDict):
+
+    container: str
+    destinationVideoBitrate: float
+    env: Any  # Environment variables to set when launching FFmpeg.
+    ffmpegPath: str  # Path to a custom FFmpeg binary.
+    h264EncoderArguments: list[str]
+    h264FilterArguments: list[str]
+    inputArguments: list[str]
+    mediaStreamOptions: ResponseMediaStreamOptions
+    url: str  # The media url for this FFmpegInput.
+    urls: list[str]  # Alternate media urls for this FFmpegInput.
+    videoDecoderArguments: list[str]
 
 class HttpRequest(TypedDict):
 
@@ -544,6 +620,7 @@ class HumiditySettingStatus(TypedDict):
 
 class LauncherApplicationInfo(TypedDict):
 
+    cloudHref: str
     description: str
     href: str
     icon: str  # Supports: mdi-icon, fa-icon, urls.
@@ -566,6 +643,12 @@ class MediaStatus(TypedDict):
     metadata: Any
     position: float
 
+class MediaStreamConfiguration(TypedDict):
+
+    audio: AudioStreamOptions
+    id: str
+    video: VideoStreamConfiguration
+
 class MediaStreamOptions(TypedDict):
     """Options passed to VideoCamera.getVideoStream to request specific media formats. The audio/video properties may be omitted to indicate no audio/video is available when calling getVideoStreamOptions or no audio/video is requested when calling getVideoStream."""
 
@@ -582,17 +665,20 @@ class MediaStreamOptions(TypedDict):
 class NotifierOptions(TypedDict):
 
     actions: list[NotificationAction]
+    android: Any
     badge: str
     body: str
     bodyWithSubtitle: str
     data: Any
     dir: NotificationDirection
+    image: str
     lang: str
+    recordedEvent: Union[RecordedEvent, Any]
     renotify: bool
     requireInteraction: bool
     silent: bool
     subtitle: str
-    tag: str
+    tag: str  # Collapse key/id.
     timestamp: float
     vibrate: VibratePattern
 
@@ -604,6 +690,7 @@ class ObjectDetectionGeneratorResult(TypedDict):
 
 class ObjectDetectionGeneratorSession(TypedDict):
 
+    clusterWorkerId: str
     settings: Any
     sourceId: str
     zones: list[ObjectDetectionZone]
@@ -611,6 +698,7 @@ class ObjectDetectionGeneratorSession(TypedDict):
 class ObjectDetectionModel(TypedDict):
 
     classes: list[str]  # Classes of objects that can be recognized. This can include motion or the names of specific people.
+    decoder: bool
     inputFormat: Any | Any | Any
     inputSize: list[float]
     name: str
@@ -620,6 +708,8 @@ class ObjectDetectionModel(TypedDict):
 
 class ObjectDetectionSession(TypedDict):
 
+    batch: float  # Denotes that this is the first sample in a batch of samples.
+    clusterWorkerId: str
     settings: Any
     sourceId: str
     zones: list[ObjectDetectionZone]
@@ -639,15 +729,18 @@ class ObjectsDetected(TypedDict):
 class PanTiltZoomCapabilities(TypedDict):
 
     pan: bool
+    presets: Any  # Preset id mapped to friendly name.
     tilt: bool
     zoom: bool
 
 class PanTiltZoomCommand(TypedDict):
 
-    movement: PanTiltZoomMovement  # Specify the movement origin. If unspecified, the movement will be relative to the current position.
+    movement: PanTiltZoomMovement  # Specify the movement type. If unspecified, the movement will be relative to the current position.
     pan: float  # Ranges between -1 and 1.
+    preset: str  # The preset to move to.
     speed: Any  # The speed of the movement.
     tilt: float  # Ranges between -1 and 1.
+    timeout: float  # The duration of the movement in milliseconds.
     zoom: float  # Ranges between 0 and 1 for max zoom.
 
 class Position(TypedDict):
@@ -655,6 +748,10 @@ class Position(TypedDict):
     accuracyRadius: float  # The accuracy radius of this position in meters.
     latitude: float
     longitude: float
+
+class PrivacyMasks(TypedDict):
+
+    masks: list[PrivacyMask]
 
 class RecordedEvent(TypedDict):
 
@@ -759,6 +856,16 @@ class ScriptSource(TypedDict):
     name: str
     script: str
 
+class ScryptedRuntimeArguments(TypedDict):
+
+    arguments: list[str]
+    executable: str
+
+class ScryptedSystemDeviceInfo(TypedDict):
+
+    deviceCreator: str  # The description of device that will be created by this DeviceCreator. For example: Example Corp Camera or ACME Light Switch.
+    settings: str  # The name of the device as seen in System Settings.
+
 class ScryptedUserAccessControl(TypedDict):
     """ScryptedUserAccessControl describes the list of devices that may be accessed by the user."""
 
@@ -775,9 +882,11 @@ class Setting(TypedDict):
 
     choices: list[str]
     combobox: bool
+    console: bool  # Flag that hte UI should open the console.
     description: str
     deviceFilter: str
     group: str
+    immediate: bool  # Flag that the UI should immediately apply this setting.
     key: str
     multiple: bool
     placeholder: str
@@ -785,7 +894,7 @@ class Setting(TypedDict):
     readonly: bool
     subgroup: str
     title: str
-    type: Any | Any | Any | Any | Any | Any | Any | Any | Any | Any | Any | Any | Any | Any
+    type: Any | Any | Any | Any | Any | Any | Any | Any | Any | Any | Any | Any | Any | Any | Any | Any
     value: SettingValue
 
 class TemperatureCommand(TypedDict):
@@ -825,16 +934,26 @@ class VideoClipThumbnailOptions(TypedDict):
 
 class VideoFrameGeneratorOptions(TypedDict):
 
+    clusterWorkerId: str
     crop: Any
     firstFrameOnly: bool
-    format: ImageFormat
+    format: str
     fps: float
     queue: float
     resize: Any
 
+class MediaConverterTypes(TypedDict):
+    """[fromMimeType, toMimeType]"""
+
+    pass
+
+
 class TamperState(TypedDict):
 
     pass
+
+
+TYPES_VERSION = "0.3.100"
 
 
 class AirPurifier:
@@ -855,6 +974,13 @@ class AmbientLightSensor:
 class AudioSensor:
 
     audioDetected: bool
+
+class AudioVolumeControl:
+
+    audioVolumes: AudioVolumes
+    async def setAudioVolumes(self, audioVolumes: AudioVolumes) -> None:
+        pass
+
 
 class Battery:
     """Battery retrieves the battery level of battery powered devices."""
@@ -882,9 +1008,9 @@ class BufferConverter:
         pass
 
 
-class CO2Sensor:
+class Buttons:
 
-    co2ppm: float
+    buttons: list[str]
 
 class Camera:
     """Camera devices can take still photos."""
@@ -900,6 +1026,17 @@ class Charger:
     """Charger reports whether or not a device is being charged from an external power source. Usually used for battery powered devices."""
 
     chargeState: ChargeState
+
+class ClusterForkInterface:
+    """Requests that the ScryptedDevice create a fork to"""
+
+    async def forkInterface(self, forkInterface: ObjectDetection, options: ClusterForkInterfaceOptions = None) -> ObjectDetection:
+        pass
+
+
+class CO2Sensor:
+
+    co2ppm: float
 
 class ColorSettingHsv:
     """ColorSettingHsv sets the color of a colored light using the HSV representation."""
@@ -1068,6 +1205,13 @@ class LuminanceSensor:
 
     luminance: float
 
+class MediaConverter:
+
+    converters: list[MediaConverterTypes]
+    async def convertMedia(self, data: Any, fromMimeType: str, toMimeType: str, options: MediaObjectOptions = None) -> Any:
+        pass
+
+
 class MediaPlayer:
     """MediaPlayer allows media playback on screen or speaker devices, such as Chromecasts or TVs."""
 
@@ -1097,7 +1241,7 @@ class Microphone:
 class MixinProvider:
     """MixinProviders can add and intercept interfaces to other devices to add or augment their behavior."""
 
-    async def canMixin(self, type: ScryptedDeviceType, interfaces: list[str]) -> list[str]:
+    async def canMixin(self, type: ScryptedDeviceType, interfaces: list[str]) -> None | list[str]:
         pass
 
     async def getMixin(self, mixinDevice: Any, mixinDeviceInterfaces: list[ScryptedInterface], mixinDeviceState: WritableDeviceState) -> Any:
@@ -1111,16 +1255,16 @@ class MotionSensor:
 
     motionDetected: bool
 
-class NOXSensor:
-
-    noxDensity: float
-
 class Notifier:
     """Notifier can be any endpoint that can receive messages, such as speakers, phone numbers, messaging clients, etc. The messages may optionally contain media."""
 
     async def sendNotification(self, title: str, options: NotifierOptions = None, media: str | MediaObject = None, icon: str | MediaObject = None) -> None:
         pass
 
+
+class NOXSensor:
+
+    noxDensity: float
 
 class OauthClient:
     """The OauthClient can be implemented to perform the browser based Oauth process from within a plugin."""
@@ -1138,7 +1282,7 @@ class ObjectDetection:
     async def detectObjects(self, mediaObject: MediaObject, session: ObjectDetectionSession = None) -> ObjectsDetected:
         pass
 
-    async def generateObjectDetections(self, videoFrames: VideoFrame, session: ObjectDetectionGeneratorSession) -> ObjectDetectionGeneratorResult:
+    async def generateObjectDetections(self, videoFrames: MediaObject | AsyncGenerator[VideoFrame, None], session: ObjectDetectionGeneratorSession) -> AsyncGenerator[ObjectDetectionGeneratorResult, None]:
         pass
 
     async def getDetectionModel(self, settings: Any = None) -> ObjectDetectionModel:
@@ -1176,6 +1320,11 @@ class OccupancySensor:
 
     occupied: bool
 
+class Online:
+    """Online denotes whether the device is online or unresponsive. It may be unresponsive due to being unplugged, network error, etc."""
+
+    online: bool
+
 class OnOff:
     """OnOff is a basic binary switch."""
 
@@ -1186,19 +1335,6 @@ class OnOff:
     async def turnOn(self) -> None:
         pass
 
-
-class Online:
-    """Online denotes whether the device is online or unresponsive. It may be unresponsive due to being unplugged, network error, etc."""
-
-    online: bool
-
-class PM10Sensor:
-
-    pm10Density: float
-
-class PM25Sensor:
-
-    pm25Density: float
 
 class PanTiltZoom:
 
@@ -1230,6 +1366,14 @@ class Pause:
         pass
 
 
+class PM10Sensor:
+
+    pm10Density: float
+
+class PM25Sensor:
+
+    pm25Density: float
+
 class PositionSensor:
 
     position: Position
@@ -1237,6 +1381,12 @@ class PositionSensor:
 class PowerSensor:
 
     powerDetected: bool
+
+class PressButtons:
+
+    async def pressButton(self, button: str) -> None:
+        pass
+
 
 class Program:
 
@@ -1333,11 +1483,30 @@ class ScryptedDevice:
         pass
 
 
+class ScryptedDeviceCreator:
+
+
+    pass
+
 class ScryptedPlugin:
 
     async def getPluginJson(self) -> Any:
         pass
 
+
+class ScryptedPluginRuntime:
+
+    scryptedRuntimeArguments: ScryptedRuntimeArguments
+
+class ScryptedSettings:
+
+
+    pass
+
+class ScryptedSystemDevice:
+    """SystemDevices are listed in the Scrypted UI."""
+
+    systemDevice: ScryptedSystemDeviceInfo  # Type of device that will be created by this DeviceCreator. For example: Example Corp Camera or ACME Light Switch.
 
 class ScryptedUser:
     """ScryptedUser represents a user managed by Scrypted. This interface can not be implemented, only extended by Mixins."""
@@ -1380,7 +1549,7 @@ class StartStop:
 class StreamService:
     """Generic bidirectional stream connection."""
 
-    async def connectStream(self, input: Any) -> Any:
+    async def connectStream(self, input: AsyncGenerator[Any, None] = None, options: Any = None) -> AsyncGenerator[Any, None]:
         pass
 
 
@@ -1392,25 +1561,7 @@ class TemperatureSetting:
     """TemperatureSetting represents a thermostat device."""
 
     temperatureSetting: TemperatureSettingStatus
-    thermostatActiveMode: ThermostatMode
-    thermostatAvailableModes: list[ThermostatMode]
-    thermostatMode: ThermostatMode
-    thermostatSetpoint: float
-    thermostatSetpointHigh: float
-    thermostatSetpointLow: float
     async def setTemperature(self, command: TemperatureCommand) -> None:
-        pass
-
-    async def setThermostatMode(self, mode: ThermostatMode) -> None:
-        pass
-
-    async def setThermostatSetpoint(self, degrees: float) -> None:
-        pass
-
-    async def setThermostatSetpointHigh(self, high: float) -> None:
-        pass
-
-    async def setThermostatSetpointLow(self, low: float) -> None:
         pass
 
 
@@ -1422,13 +1573,22 @@ class Thermometer:
         pass
 
 
+class TTY:
+    """TTY connection offered by a remote device that can be connected to by an interactive terminal interface.  Implementors should also implement StreamService to handle the actual data transfer."""
+
+
+    pass
+
+class TTYSettings:
+    """TTYSettings allows TTY backends to query plugins for modifications to the (non-)interactive terminal environment."""
+
+    async def getTTYSettings(self) -> Any:
+        pass
+
+
 class UltravioletSensor:
 
     ultraviolet: float
-
-class VOCSensor:
-
-    vocDensity: float
 
 class VideoCamera:
     """VideoCamera devices can capture video streams."""
@@ -1442,7 +1602,16 @@ class VideoCamera:
 
 class VideoCameraConfiguration:
 
-    async def setVideoStreamOptions(self, options: MediaStreamOptions) -> None:
+    async def setVideoStreamOptions(self, options: MediaStreamOptions) -> MediaStreamConfiguration:
+        pass
+
+
+class VideoCameraMask:
+
+    async def getPrivacyMasks(self) -> PrivacyMasks:
+        pass
+
+    async def setPrivacyMasks(self, masks: PrivacyMasks) -> None:
         pass
 
 
@@ -1451,10 +1620,10 @@ class VideoClips:
     async def getVideoClip(self, videoId: str) -> MediaObject:
         pass
 
-    async def getVideoClipThumbnail(self, thumbnailId: str, options: VideoClipThumbnailOptions = None) -> MediaObject:
+    async def getVideoClips(self, options: VideoClipOptions = None) -> list[VideoClip]:
         pass
 
-    async def getVideoClips(self, options: VideoClipOptions = None) -> list[VideoClip]:
+    async def getVideoClipThumbnail(self, thumbnailId: str, options: VideoClipThumbnailOptions = None) -> MediaObject:
         pass
 
     async def removeVideoClips(self, videoClipIds: list[str]) -> None:
@@ -1463,7 +1632,7 @@ class VideoClips:
 
 class VideoFrameGenerator:
 
-    async def generateVideoFrames(self, mediaObject: MediaObject, options: VideoFrameGeneratorOptions = None) -> VideoFrame:
+    async def generateVideoFrames(self, mediaObject: MediaObject, options: VideoFrameGeneratorOptions = None) -> AsyncGenerator[VideoFrame, None]:
         pass
 
 
@@ -1491,6 +1660,10 @@ class VideoRecorderManagement:
     async def setRecordingActive(self, recordingActive: bool) -> None:
         pass
 
+
+class VOCSensor:
+
+    vocDensity: float
 
 class Logger:
     """Logger is exposed via log.* to allow writing to the Scrypted log."""
@@ -1581,9 +1754,6 @@ class SystemManager:
     def getDeviceByName(self, name: str) -> ScryptedDevice:
         pass
 
-    def getDeviceState(self, id: str) -> Any:
-        pass
-
     def getSystemState(self) -> Any:
         pass
 
@@ -1598,12 +1768,6 @@ class SystemManager:
 
 
 class MediaManager:
-
-    async def addConverter(self, converter: BufferConverter) -> None:
-        pass
-
-    async def clearConverters(self) -> None:
-        pass
 
     async def convertMediaObject(self, mediaObject: MediaObject, toMimeType: str) -> Any:
         pass
@@ -1623,13 +1787,13 @@ class MediaManager:
     async def convertMediaObjectToUrl(self, mediaObject: str | MediaObject, toMimeType: str) -> str:
         pass
 
-    async def createFFmpegMediaObject(self, ffmpegInput: FFmpegInput, options: MediaObjectOptions = None) -> MediaObject:
+    async def createFFmpegMediaObject(self, ffmpegInput: FFmpegInput, options: Any = None) -> Union[MediaObject, Any]:
         pass
 
     async def createMediaObject(self, data: Any, mimeType: str, options: Any = None) -> Union[MediaObject, Any]:
         pass
 
-    async def createMediaObjectFromUrl(self, data: str, options: Any = None) -> MediaObject:
+    async def createMediaObjectFromUrl(self, data: str, options: Any = None) -> Union[MediaObject, Any]:
         pass
 
     async def getFFmpegPath(self) -> str:
@@ -1679,6 +1843,18 @@ class EndpointManager:
         pass
 
 
+class ClusterManager:
+
+    def getClusterMode(self) -> Any | Any:
+        pass
+
+    def getClusterWorkerId(self) -> str:
+        pass
+
+    async def getClusterWorkers(self) -> Mapping[str, ClusterWorker]:
+        pass
+
+
 class ScryptedInterfaceProperty(str, Enum):
     id = "id"
     info = "info"
@@ -1694,24 +1870,21 @@ class ScryptedInterfaceProperty(str, Enum):
     providerId = "providerId"
     room = "room"
     type = "type"
+    scryptedRuntimeArguments = "scryptedRuntimeArguments"
     on = "on"
     brightness = "brightness"
     colorTemperature = "colorTemperature"
     rgb = "rgb"
     hsv = "hsv"
+    buttons = "buttons"
     running = "running"
     paused = "paused"
     docked = "docked"
     temperatureSetting = "temperatureSetting"
-    thermostatActiveMode = "thermostatActiveMode"
-    thermostatAvailableModes = "thermostatAvailableModes"
-    thermostatMode = "thermostatMode"
-    thermostatSetpoint = "thermostatSetpoint"
-    thermostatSetpointHigh = "thermostatSetpointHigh"
-    thermostatSetpointLow = "thermostatSetpointLow"
     temperature = "temperature"
     temperatureUnit = "temperatureUnit"
     humidity = "humidity"
+    audioVolumes = "audioVolumes"
     recordingActive = "recordingActive"
     ptzCapabilities = "ptzCapabilities"
     lockState = "lockState"
@@ -1721,6 +1894,7 @@ class ScryptedInterfaceProperty(str, Enum):
     online = "online"
     fromMimeType = "fromMimeType"
     toMimeType = "toMimeType"
+    converters = "converters"
     binaryState = "binaryState"
     tampered = "tampered"
     powerDetected = "powerDetected"
@@ -1745,6 +1919,7 @@ class ScryptedInterfaceProperty(str, Enum):
     humiditySetting = "humiditySetting"
     fan = "fan"
     applicationInfo = "applicationInfo"
+    systemDevice = "systemDevice"
 
 class ScryptedInterfaceMethods(str, Enum):
     listen = "listen"
@@ -1762,6 +1937,7 @@ class ScryptedInterfaceMethods(str, Enum):
     setColorTemperature = "setColorTemperature"
     setRgb = "setRgb"
     setHsv = "setHsv"
+    pressButton = "pressButton"
     sendNotification = "sendNotification"
     start = "start"
     stop = "stop"
@@ -1769,18 +1945,17 @@ class ScryptedInterfaceMethods(str, Enum):
     resume = "resume"
     dock = "dock"
     setTemperature = "setTemperature"
-    setThermostatMode = "setThermostatMode"
-    setThermostatSetpoint = "setThermostatSetpoint"
-    setThermostatSetpointHigh = "setThermostatSetpointHigh"
-    setThermostatSetpointLow = "setThermostatSetpointLow"
     setTemperatureUnit = "setTemperatureUnit"
     getPictureOptions = "getPictureOptions"
     takePicture = "takePicture"
     getAudioStream = "getAudioStream"
+    setAudioVolumes = "setAudioVolumes"
     startDisplay = "startDisplay"
     stopDisplay = "stopDisplay"
     getVideoStream = "getVideoStream"
     getVideoStreamOptions = "getVideoStreamOptions"
+    getPrivacyMasks = "getPrivacyMasks"
+    setPrivacyMasks = "setPrivacyMasks"
     getRecordingStream = "getRecordingStream"
     getRecordingStreamCurrentTime = "getRecordingStreamCurrentTime"
     getRecordingStreamOptions = "getRecordingStreamOptions"
@@ -1790,8 +1965,8 @@ class ScryptedInterfaceMethods(str, Enum):
     ptzCommand = "ptzCommand"
     getRecordedEvents = "getRecordedEvents"
     getVideoClip = "getVideoClip"
-    getVideoClipThumbnail = "getVideoClipThumbnail"
     getVideoClips = "getVideoClips"
+    getVideoClipThumbnail = "getVideoClipThumbnail"
     removeVideoClips = "removeVideoClips"
     setVideoStreamOptions = "setVideoStreamOptions"
     startIntercom = "startIntercom"
@@ -1821,6 +1996,7 @@ class ScryptedInterfaceMethods(str, Enum):
     skipNext = "skipNext"
     skipPrevious = "skipPrevious"
     convert = "convert"
+    convertMedia = "convertMedia"
     getSettings = "getSettings"
     putSetting = "putSetting"
     armSecuritySystem = "armSecuritySystem"
@@ -1839,6 +2015,7 @@ class ScryptedInterfaceMethods(str, Enum):
     eval = "eval"
     loadScripts = "loadScripts"
     saveScript = "saveScript"
+    forkInterface = "forkInterface"
     trackObjects = "trackObjects"
     getDetectionInput = "getDetectionInput"
     getObjectTypes = "getObjectTypes"
@@ -1852,6 +2029,7 @@ class ScryptedInterfaceMethods(str, Enum):
     getScryptedUserAccessControl = "getScryptedUserAccessControl"
     generateVideoFrames = "generateVideoFrames"
     connectStream = "connectStream"
+    getTTYSettings = "getTTYSettings"
 
 class DeviceState:
 
@@ -1967,6 +2145,14 @@ class DeviceState:
         self.setScryptedProperty("type", value)
 
     @property
+    def scryptedRuntimeArguments(self) -> ScryptedRuntimeArguments:
+        return self.getScryptedProperty("scryptedRuntimeArguments")
+
+    @scryptedRuntimeArguments.setter
+    def scryptedRuntimeArguments(self, value: ScryptedRuntimeArguments):
+        self.setScryptedProperty("scryptedRuntimeArguments", value)
+
+    @property
     def on(self) -> bool:
         return self.getScryptedProperty("on")
 
@@ -2007,6 +2193,14 @@ class DeviceState:
         self.setScryptedProperty("hsv", value)
 
     @property
+    def buttons(self) -> list[str]:
+        return self.getScryptedProperty("buttons")
+
+    @buttons.setter
+    def buttons(self, value: list[str]):
+        self.setScryptedProperty("buttons", value)
+
+    @property
     def running(self) -> bool:
         return self.getScryptedProperty("running")
 
@@ -2039,54 +2233,6 @@ class DeviceState:
         self.setScryptedProperty("temperatureSetting", value)
 
     @property
-    def thermostatActiveMode(self) -> ThermostatMode:
-        return self.getScryptedProperty("thermostatActiveMode")
-
-    @thermostatActiveMode.setter
-    def thermostatActiveMode(self, value: ThermostatMode):
-        self.setScryptedProperty("thermostatActiveMode", value)
-
-    @property
-    def thermostatAvailableModes(self) -> list[ThermostatMode]:
-        return self.getScryptedProperty("thermostatAvailableModes")
-
-    @thermostatAvailableModes.setter
-    def thermostatAvailableModes(self, value: list[ThermostatMode]):
-        self.setScryptedProperty("thermostatAvailableModes", value)
-
-    @property
-    def thermostatMode(self) -> ThermostatMode:
-        return self.getScryptedProperty("thermostatMode")
-
-    @thermostatMode.setter
-    def thermostatMode(self, value: ThermostatMode):
-        self.setScryptedProperty("thermostatMode", value)
-
-    @property
-    def thermostatSetpoint(self) -> float:
-        return self.getScryptedProperty("thermostatSetpoint")
-
-    @thermostatSetpoint.setter
-    def thermostatSetpoint(self, value: float):
-        self.setScryptedProperty("thermostatSetpoint", value)
-
-    @property
-    def thermostatSetpointHigh(self) -> float:
-        return self.getScryptedProperty("thermostatSetpointHigh")
-
-    @thermostatSetpointHigh.setter
-    def thermostatSetpointHigh(self, value: float):
-        self.setScryptedProperty("thermostatSetpointHigh", value)
-
-    @property
-    def thermostatSetpointLow(self) -> float:
-        return self.getScryptedProperty("thermostatSetpointLow")
-
-    @thermostatSetpointLow.setter
-    def thermostatSetpointLow(self, value: float):
-        self.setScryptedProperty("thermostatSetpointLow", value)
-
-    @property
     def temperature(self) -> float:
         return self.getScryptedProperty("temperature")
 
@@ -2109,6 +2255,14 @@ class DeviceState:
     @humidity.setter
     def humidity(self, value: float):
         self.setScryptedProperty("humidity", value)
+
+    @property
+    def audioVolumes(self) -> AudioVolumes:
+        return self.getScryptedProperty("audioVolumes")
+
+    @audioVolumes.setter
+    def audioVolumes(self, value: AudioVolumes):
+        self.setScryptedProperty("audioVolumes", value)
 
     @property
     def recordingActive(self) -> bool:
@@ -2181,6 +2335,14 @@ class DeviceState:
     @toMimeType.setter
     def toMimeType(self, value: str):
         self.setScryptedProperty("toMimeType", value)
+
+    @property
+    def converters(self) -> list[MediaConverterTypes]:
+        return self.getScryptedProperty("converters")
+
+    @converters.setter
+    def converters(self, value: list[MediaConverterTypes]):
+        self.setScryptedProperty("converters", value)
 
     @property
     def binaryState(self) -> bool:
@@ -2374,6 +2536,14 @@ class DeviceState:
     def applicationInfo(self, value: LauncherApplicationInfo):
         self.setScryptedProperty("applicationInfo", value)
 
+    @property
+    def systemDevice(self) -> ScryptedSystemDeviceInfo:
+        return self.getScryptedProperty("systemDevice")
+
+    @systemDevice.setter
+    def systemDevice(self, value: ScryptedSystemDeviceInfo):
+        self.setScryptedProperty("systemDevice", value)
+
 ScryptedInterfaceDescriptors = {
   "ScryptedDevice": {
     "name": "ScryptedDevice",
@@ -2408,6 +2578,13 @@ ScryptedInterfaceDescriptors = {
       "getPluginJson"
     ],
     "properties": []
+  },
+  "ScryptedPluginRuntime": {
+    "name": "ScryptedPluginRuntime",
+    "methods": [],
+    "properties": [
+      "scryptedRuntimeArguments"
+    ]
   },
   "OnOff": {
     "name": "OnOff",
@@ -2457,6 +2634,20 @@ ScryptedInterfaceDescriptors = {
       "hsv"
     ]
   },
+  "Buttons": {
+    "name": "Buttons",
+    "methods": [],
+    "properties": [
+      "buttons"
+    ]
+  },
+  "PressButtons": {
+    "name": "PressButtons",
+    "methods": [
+      "pressButton"
+    ],
+    "properties": []
+  },
   "Notifier": {
     "name": "Notifier",
     "methods": [
@@ -2496,20 +2687,10 @@ ScryptedInterfaceDescriptors = {
   "TemperatureSetting": {
     "name": "TemperatureSetting",
     "methods": [
-      "setTemperature",
-      "setThermostatMode",
-      "setThermostatSetpoint",
-      "setThermostatSetpointHigh",
-      "setThermostatSetpointLow"
+      "setTemperature"
     ],
     "properties": [
-      "temperatureSetting",
-      "thermostatActiveMode",
-      "thermostatAvailableModes",
-      "thermostatMode",
-      "thermostatSetpoint",
-      "thermostatSetpointHigh",
-      "thermostatSetpointLow"
+      "temperatureSetting"
     ]
   },
   "Thermometer": {
@@ -2544,6 +2725,15 @@ ScryptedInterfaceDescriptors = {
     ],
     "properties": []
   },
+  "AudioVolumeControl": {
+    "name": "AudioVolumeControl",
+    "methods": [
+      "setAudioVolumes"
+    ],
+    "properties": [
+      "audioVolumes"
+    ]
+  },
   "Display": {
     "name": "Display",
     "methods": [
@@ -2557,6 +2747,14 @@ ScryptedInterfaceDescriptors = {
     "methods": [
       "getVideoStream",
       "getVideoStreamOptions"
+    ],
+    "properties": []
+  },
+  "VideoCameraMask": {
+    "name": "VideoCameraMask",
+    "methods": [
+      "getPrivacyMasks",
+      "setPrivacyMasks"
     ],
     "properties": []
   },
@@ -2600,8 +2798,8 @@ ScryptedInterfaceDescriptors = {
     "name": "VideoClips",
     "methods": [
       "getVideoClip",
-      "getVideoClipThumbnail",
       "getVideoClips",
+      "getVideoClipThumbnail",
       "removeVideoClips"
     ],
     "properties": []
@@ -2743,6 +2941,15 @@ ScryptedInterfaceDescriptors = {
     "properties": [
       "fromMimeType",
       "toMimeType"
+    ]
+  },
+  "MediaConverter": {
+    "name": "MediaConverter",
+    "methods": [
+      "convertMedia"
+    ],
+    "properties": [
+      "converters"
     ]
   },
   "Settings": {
@@ -2960,6 +3167,13 @@ ScryptedInterfaceDescriptors = {
     ],
     "properties": []
   },
+  "ClusterForkInterface": {
+    "name": "ClusterForkInterface",
+    "methods": [
+      "forkInterface"
+    ],
+    "properties": []
+  },
   "ObjectTracker": {
     "name": "ObjectTracker",
     "methods": [
@@ -3053,6 +3267,35 @@ ScryptedInterfaceDescriptors = {
       "connectStream"
     ],
     "properties": []
+  },
+  "TTY": {
+    "name": "TTY",
+    "methods": [],
+    "properties": []
+  },
+  "TTYSettings": {
+    "name": "TTYSettings",
+    "methods": [
+      "getTTYSettings"
+    ],
+    "properties": []
+  },
+  "ScryptedSystemDevice": {
+    "name": "ScryptedSystemDevice",
+    "methods": [],
+    "properties": [
+      "systemDevice"
+    ]
+  },
+  "ScryptedDeviceCreator": {
+    "name": "ScryptedDeviceCreator",
+    "methods": [],
+    "properties": []
+  },
+  "ScryptedSettings": {
+    "name": "ScryptedSettings",
+    "methods": [],
+    "properties": []
   }
 }
 
@@ -3066,13 +3309,16 @@ class EventListenerRegister:
 class HttpResponse:
     """Response object provided by the HttpRequestHandler."""
 
-    def send(self, body: str) -> None:
+    def send(self, body: str, options: HttpResponseOptions = None) -> None:
         pass
 
-    def sendFile(self, path: str) -> None:
+    def sendFile(self, path: str, options: HttpResponseOptions = None) -> None:
         pass
 
-    def sendSocket(self, socket: Any, options: HttpResponseOptions) -> None:
+    def sendSocket(self, socket: Any, options: HttpResponseOptions = None) -> None:
+        pass
+
+    def sendStream(self, stream: AsyncGenerator[bytearray, None], options: HttpResponseOptions = None) -> None:
         pass
 
 
@@ -3095,7 +3341,8 @@ class WritableDeviceState:
 
 class Image:
 
-    format: ImageFormat  # The in raw memory format of this image. Operations of this image may only safely request this format, or a compressed format such as jpg.
+    ffmpegFormats: bool
+    format: str  # The in raw memory format of this image. Operations of this image may only safely request this format, or a compressed format such as jpg.
     height: float
     width: float
     async def close(self) -> None:

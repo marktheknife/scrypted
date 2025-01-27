@@ -1,19 +1,93 @@
 import { sleep } from '@scrypted/common/src/sleep';
-import sdk, { Camera, DeviceCreatorSettings, DeviceInformation, Intercom, MediaObject, ObjectDetectionTypes, ObjectDetector, ObjectsDetected, PanTiltZoom, PanTiltZoomCommand, PictureOptions, Reboot, ScryptedDeviceType, ScryptedInterface, Setting } from "@scrypted/sdk";
+import sdk, { Brightness, Camera, Device, DeviceCreatorSettings, DeviceInformation, DeviceProvider, Intercom, MediaObject, ObjectDetectionTypes, ObjectDetector, ObjectsDetected, OnOff, PanTiltZoom, PanTiltZoomCommand, Reboot, RequestPictureOptions, ScryptedDeviceBase, ScryptedDeviceType, ScryptedInterface, Setting } from "@scrypted/sdk";
 import { StorageSettings } from '@scrypted/sdk/storage-settings';
 import { EventEmitter } from "stream";
-import { Destroyable, RtspProvider, RtspSmartCamera, UrlMediaStreamOptions } from "../../rtsp/src/rtsp";
+import { createRtspMediaStreamOptions, Destroyable, RtspProvider, RtspSmartCamera, UrlMediaStreamOptions } from "../../rtsp/src/rtsp";
 import { OnvifCameraAPI, OnvifEvent, connectCameraAPI } from './onvif-api';
 import { listenEvents } from './onvif-events';
 import { OnvifIntercom } from './onvif-intercom';
-import { AIState, DevInfo, Enc, ReolinkCameraClient } from './reolink-api';
+import { DevInfo } from './probe';
+import { AIState, Enc, ReolinkCameraClient } from './reolink-api';
 
-class ReolinkCamera extends RtspSmartCamera implements Camera, Reboot, Intercom, ObjectDetector, PanTiltZoom {
+class ReolinkCameraSiren extends ScryptedDeviceBase implements OnOff {
+    sirenTimeout: NodeJS.Timeout;
+
+    constructor(public camera: ReolinkCamera, nativeId: string) {
+        super(nativeId);
+        this.on = false;
+    }
+
+    async turnOff() {
+        this.on = false;
+        await this.setSiren(false);
+    }
+
+    async turnOn() {
+        this.on = true;
+        await this.setSiren(true);
+    }
+
+    private async setSiren(on: boolean) {
+        const api = this.camera.getClient();
+
+        // doorbell doesn't seem to support alarm_mode = 'manul'
+        if (this.camera.storageSettings.values.doorbell) {
+            if (!on) {
+                clearInterval(this.sirenTimeout);
+                await api.setSiren(false);
+                return;
+            }
+
+            // siren lasts around 4 seconds.
+            this.sirenTimeout = setTimeout(async () => {
+                await this.turnOff();
+            }, 4000);
+
+            await api.setSiren(true, 1);
+            return;
+        }
+        await api.setSiren(on);
+    }
+}
+
+class ReolinkCameraFloodlight extends ScryptedDeviceBase implements OnOff, Brightness {
+    constructor(public camera: ReolinkCamera, nativeId: string) {
+        super(nativeId);
+        this.on = false;
+    }
+
+    async setBrightness(brightness: number): Promise<void> {
+        this.brightness = brightness;
+        await this.setFloodlight(undefined, brightness);
+    }
+
+    async turnOff() {
+        this.on = false;
+        await this.setFloodlight(false);
+    }
+
+    async turnOn() {
+        this.on = true;
+        await this.setFloodlight(true);
+    }
+
+    private async setFloodlight(on?: boolean, brightness?: number) {
+        const api = this.camera.getClientWithToken();
+
+        await api.setWhiteLedState(on, brightness);
+    }
+}
+
+class ReolinkCamera extends RtspSmartCamera implements Camera, DeviceProvider, Reboot, Intercom, ObjectDetector, PanTiltZoom {
     client: ReolinkCameraClient;
+    clientWithToken: ReolinkCameraClient;
     onvifClient: OnvifCameraAPI;
     onvifIntercom = new OnvifIntercom(this);
     videoStreamOptions: Promise<UrlMediaStreamOptions[]>;
     motionTimeout: NodeJS.Timeout;
+    siren: ReolinkCameraSiren;
+    floodlight: ReolinkCameraFloodlight;
+    batteryTimeout: NodeJS.Timeout;
 
     storageSettings = new StorageSettings(this, {
         doorbell: {
@@ -28,7 +102,7 @@ class ReolinkCamera extends RtspSmartCamera implements Camera, Reboot, Intercom,
             type: 'number',
         },
         motionTimeout: {
-            group: 'Advanced',
+            subgroup: 'Advanced',
             title: 'Motion Timeout',
             defaultValue: 20,
             type: 'number',
@@ -38,6 +112,7 @@ class ReolinkCamera extends RtspSmartCamera implements Camera, Reboot, Intercom,
             hide: true,
         },
         ptz: {
+            subgroup: 'Advanced',
             title: 'PTZ Capabilities',
             choices: [
                 'Pan',
@@ -50,28 +125,145 @@ class ReolinkCamera extends RtspSmartCamera implements Camera, Reboot, Intercom,
                 this.updatePtzCaps();
             },
         },
-        doorbellUseOnvifDetections: {
+        presets: {
+            subgroup: 'Advanced',
+            title: 'Presets',
+            description: 'PTZ Presets in the format "id=name". Where id is the PTZ Preset identifier and name is a friendly name.',
+            multiple: true,
+            defaultValue: [],
+            combobox: true,
+            onPut: async (ov, presets: string[]) => {
+                const caps = {
+                    ...this.ptzCapabilities,
+                    presets: {},
+                };
+                for (const preset of presets) {
+                    const [key, name] = preset.split('=');
+                    caps.presets[key] = name;
+                }
+                this.ptzCapabilities = caps;
+            },
+            mapGet: () => {
+                const presets = this.ptzCapabilities?.presets || {};
+                return Object.entries(presets).map(([key, name]) => key + '=' + name);
+            },
+        },
+        cachedPresets: {
+            multiple: true,
             hide: true,
-            defaultValue: true,
-        }
+            json: true,
+            defaultValue: [],
+        },
+        deviceInfo: {
+            json: true,
+            hide: true
+        },
+        abilities: {
+            json: true,
+            hide: true
+        },
+        useOnvifDetections: {
+            subgroup: 'Advanced',
+            title: 'Use ONVIF for Object Detection',
+            choices: [
+                'Default',
+                'Enabled',
+                'Disabled',
+            ],
+            defaultValue: 'Default',
+        },
+        useOnvifTwoWayAudio: {
+            subgroup: 'Advanced',
+            title: 'Use ONVIF for Two-Way Audio',
+            type: 'boolean',
+        },
     });
 
     constructor(nativeId: string, provider: RtspProvider) {
         super(nativeId, provider);
 
-        this.updateDeviceInfo();
-        this.updateDevice();
+        this.storageSettings.settings.useOnvifTwoWayAudio.onGet = async () => {
+            return {
+                hide: !!this.storageSettings.values.doorbell,
+            }
+        };
 
-        this.updatePtzCaps();
+        this.storageSettings.settings.ptz.onGet = async () => {
+            return {
+                hide: !!this.storageSettings.values.doorbell,
+            }
+        };
+
+        this.storageSettings.settings.presets.onGet = async () => {
+            const choices = this.storageSettings.values.cachedPresets.map((preset) => preset.id + '=' + preset.name);
+            return {
+                choices,
+            };
+        };
+
+        this.updateDeviceInfo();
+        (async () => {
+            this.updatePtzCaps();
+            try {
+                await this.getPresets();
+            } catch (e) {
+                this.console.log('Fail fetching presets', e);
+            }
+            const api = this.getClient();
+            const deviceInfo = await api.getDeviceInfo();
+            this.console.log('deviceInfo', JSON.stringify(deviceInfo));
+            this.storageSettings.values.deviceInfo = deviceInfo;
+            await this.updateAbilities();
+            await this.updateDevice();
+            await this.reportDevices();
+        })()
+            .catch(e => {
+                this.console.log('device refresh failed', e);
+            });
     }
 
     updatePtzCaps() {
         const { ptz } = this.storageSettings.values;
         this.ptzCapabilities = {
+            ...this.ptzCapabilities,
             pan: ptz?.includes('Pan'),
             tilt: ptz?.includes('Tilt'),
             zoom: ptz?.includes('Zoom'),
         }
+    }
+
+    async getPresets() {
+        const client = this.getClient();
+        const ptzPresets = await client.getPtzPresets();
+        this.console.log(`Presets: ${JSON.stringify(ptzPresets)}`)
+        this.storageSettings.values.cachedPresets = ptzPresets;
+    }
+
+    async updateAbilities() {
+        const api = this.getClient();
+        const apiWithToken = this.getClientWithToken();
+        let abilities;
+        try {
+            abilities = await api.getAbility();
+        } catch (e) {
+            abilities = await apiWithToken.getAbility();
+        }
+        this.storageSettings.values.abilities = abilities;
+        this.console.log('getAbility', JSON.stringify(abilities));
+    }
+
+    supportsOnvifDetections() {
+        const onvif: string[] = [
+            // wifi
+            'CX410W',
+            'Reolink Video Doorbell WiFi',
+
+            // poe
+            'CX410',
+            'CX810',
+            'Reolink Video Doorbell PoE',
+        ];
+        return onvif.includes(this.storageSettings.values.deviceInfo?.model);
     }
 
     async getDetectionInput(detectionId: string, eventId?: any): Promise<MediaObject> {
@@ -84,14 +276,8 @@ class ReolinkCamera extends RtspSmartCamera implements Camera, Reboot, Intercom,
     }
 
     async getObjectTypes(): Promise<ObjectDetectionTypes> {
-        if (this.storageSettings.values.doorbell && this.storageSettings.values.doorbellUseOnvifDetections) {
-            return {
-                classes: ['person'],
-            };
-        }
-
         try {
-            const ai: AIState = this.storageSettings.values.hasObjectDetector[0]?.value;
+            const ai: AIState = this.storageSettings.values.hasObjectDetector?.value;
             const classes: string[] = [];
 
             for (const key of Object.keys(ai)) {
@@ -125,6 +311,31 @@ class ReolinkCamera extends RtspSmartCamera implements Camera, Reboot, Intercom,
         return this.onvifIntercom.stopIntercom();
     }
 
+    hasSiren() {
+        return this.storageSettings.values.abilities?.value?.Ability?.supportAudioAlarm?.ver
+            && this.storageSettings.values.abilities?.value?.Ability?.supportAudioAlarm?.ver !== 0;
+    }
+
+    hasFloodlight() {
+        const channel = this.getRtspChannel();
+
+        const channelData = this.storageSettings.values.abilities?.value?.Ability?.abilityChn?.[channel];
+        if (channelData) {
+            const floodLightConfigVer = channelData.floodLight?.ver ?? 0;
+            const supportFLswitchConfigVer = channelData.supportFLswitch?.ver ?? 0;
+            const supportFLBrightnessConfigVer = channelData.supportFLBrightness?.ver ?? 0;
+
+            return floodLightConfigVer > 0 || supportFLswitchConfigVer > 0 || supportFLBrightnessConfigVer > 0;
+        }
+
+        return false;
+    }
+
+    hasBattery() {
+        const batteryConfigVer = this.storageSettings.values.abilities?.value?.Ability?.abilityChn?.[this.getRtspChannel()]?.battery?.ver ?? 0;
+        return batteryConfigVer > 0;
+    }
+
     async updateDevice() {
         const interfaces = this.provider.getInterfaces();
         let type = ScryptedDeviceType.Camera;
@@ -132,18 +343,49 @@ class ReolinkCamera extends RtspSmartCamera implements Camera, Reboot, Intercom,
         if (this.storageSettings.values.doorbell) {
             interfaces.push(
                 ScryptedInterface.BinarySensor,
-                ScryptedInterface.Intercom
             );
             type = ScryptedDeviceType.Doorbell;
             name = 'Reolink Doorbell';
         }
+        if (this.storageSettings.values.doorbell || this.storageSettings.values.useOnvifTwoWayAudio) {
+            interfaces.push(
+                ScryptedInterface.Intercom
+            );
+        }
+
         if (this.storageSettings.values.ptz?.length) {
             interfaces.push(ScryptedInterface.PanTiltZoom);
         }
         if (this.storageSettings.values.hasObjectDetector) {
             interfaces.push(ScryptedInterface.ObjectDetector);
         }
-        await this.provider.updateDevice(this.nativeId, name, interfaces, type);
+        if (this.hasSiren() || this.hasFloodlight())
+            interfaces.push(ScryptedInterface.DeviceProvider);
+        if (this.hasBattery()) {
+            interfaces.push(ScryptedInterface.Battery, ScryptedInterface.Online);
+            this.startBatteryCheckInterval();
+        }
+
+        await this.provider.updateDevice(this.nativeId, this.name ?? name, interfaces, type);
+    }
+
+    startBatteryCheckInterval() {
+        if (this.batteryTimeout) {
+            clearInterval(this.batteryTimeout);
+        }
+
+        this.batteryTimeout = setInterval(async () => {
+            const api = this.getClientWithToken();
+
+            try {
+                const { batteryPercent, sleep } = await api.getBatteryInfo();
+                this.batteryLevel = batteryPercent;
+                this.online = !sleep;
+            }
+            catch (e) {
+                this.console.log('Error in getting battery info', e);
+            }
+        }, 1000 * 60 * 30);
     }
 
     async reboot() {
@@ -157,6 +399,10 @@ class ReolinkCamera extends RtspSmartCamera implements Camera, Reboot, Intercom,
             return;
         const info = this.info || {};
         info.ip = ip;
+        info.serialNumber = this.storageSettings.values.deviceInfo?.serial;
+        info.firmware = this.storageSettings.values.deviceInfo?.firmVer;
+        info.version = this.storageSettings.values.deviceInfo?.hardVer;
+        info.model = this.storageSettings.values.deviceInfo?.model;
         info.manufacturer = 'Reolink';
         info.managementUrl = `http://${ip}`;
         this.info = info;
@@ -168,6 +414,11 @@ class ReolinkCamera extends RtspSmartCamera implements Camera, Reboot, Intercom,
         return this.client;
     }
 
+    getClientWithToken() {
+        if (!this.clientWithToken)
+            this.clientWithToken = new ReolinkCameraClient(this.getHttpAddress(), this.getUsername(), this.getPassword(), this.getRtspChannel(), this.console, true);
+        return this.clientWithToken;
+    }
 
     async getOnvifClient() {
         if (!this.onvifClient)
@@ -176,7 +427,7 @@ class ReolinkCamera extends RtspSmartCamera implements Camera, Reboot, Intercom,
     }
 
     createOnvifClient() {
-        return connectCameraAPI(this.getHttpAddress(), this.getUsername(), this.getPassword(), this.console, this.storage.getItem('onvifDoorbellEvent'));
+        return connectCameraAPI(this.getHttpAddress(), this.getUsername(), this.getPassword(), this.console, this.storageSettings.values.doorbell ? this.storage.getItem('onvifDoorbellEvent') : undefined);
     }
 
     async listenEvents() {
@@ -186,6 +437,7 @@ class ReolinkCamera extends RtspSmartCamera implements Camera, Reboot, Intercom,
         // reolink ai might not trigger motion if objects are detected, weird.
         const startAI = async (ret: Destroyable, triggerMotion: () => void) => {
             let hasSucceeded = false;
+            let hasSet = false;
             while (!killed) {
                 try {
                     const ai = await client.getAiState();
@@ -204,11 +456,13 @@ class ReolinkCamera extends RtspSmartCamera implements Camera, Reboot, Intercom,
                     if (!classes.length)
                         return;
 
-                    hasSucceeded = true;
-                    if (!this.storageSettings.values.hasObjectDetector) {
-                        this.storageSettings.values.hasObjectDetector = ai.data;
-                        this.updateDevice();
+
+                    if (!hasSet) {
+                        hasSet = true;
+                        this.storageSettings.values.hasObjectDetector = ai;
                     }
+
+                    hasSucceeded = true;
                     const od: ObjectsDetected = {
                         timestamp: Date.now(),
                         detections: [],
@@ -236,34 +490,46 @@ class ReolinkCamera extends RtspSmartCamera implements Camera, Reboot, Intercom,
             }
         }
 
-        if (this.storageSettings.values.doorbell) {
+        const useOnvifDetections: boolean = (this.storageSettings.values.useOnvifDetections === 'Default'
+            && (this.supportsOnvifDetections() || this.storageSettings.values.doorbell))
+            || this.storageSettings.values.useOnvifDetections === 'Enabled';
+        if (useOnvifDetections) {
             const ret = await listenEvents(this, await this.createOnvifClient(), this.storageSettings.values.motionTimeout * 1000);
-            if (!this.storageSettings.values.doorbellUseOnvifDetections) {
-                startAI(ret, ret.triggerMotion);
-            }
-            else {
-                ret.on('onvifEvent', (eventTopic: string, dataValue: any) => {
-                    if (eventTopic.includes('PeopleDetect')) {
-                        if (dataValue) {
-                            ret.emit('event', OnvifEvent.MotionStart);
+            ret.on('onvifEvent', (eventTopic: string, dataValue: any) => {
+                let className: string;
+                if (eventTopic.includes('PeopleDetect')) {
+                    className = 'people';
+                }
+                else if (eventTopic.includes('FaceDetect')) {
+                    className = 'face';
+                }
+                else if (eventTopic.includes('VehicleDetect')) {
+                    className = 'vehicle';
+                }
+                else if (eventTopic.includes('DogCatDetect')) {
+                    className = 'dog_cat';
+                }
+                else if (eventTopic.includes('Package')) {
+                    className = 'package';
+                }
+                if (className && dataValue) {
+                    ret.emit('event', OnvifEvent.MotionStart);
 
-                            const od: ObjectsDetected = {
-                                timestamp: Date.now(),
-                                detections: [
-                                    {
-                                        className: 'person',
-                                        score: 1,
-                                    }
-                                ],
-                            };
-                            sdk.deviceManager.onDeviceEvent(this.nativeId, ScryptedInterface.ObjectDetector, od);
-                        }
-                        else {
-                            ret.emit('event', OnvifEvent.MotionStop);
-                        }
-                    }
-                });
-            }
+                    const od: ObjectsDetected = {
+                        timestamp: Date.now(),
+                        detections: [
+                            {
+                                className,
+                                score: 1,
+                            }
+                        ],
+                    };
+                    sdk.deviceManager.onDeviceEvent(this.nativeId, ScryptedInterface.ObjectDetector, od);
+                }
+                else {
+                    ret.emit('event', OnvifEvent.MotionStop);
+                }
+            });
 
             ret.on('close', () => killed = true);
             ret.on('error', () => killed = true);
@@ -306,8 +572,8 @@ class ReolinkCamera extends RtspSmartCamera implements Camera, Reboot, Intercom,
         return ret;
     }
 
-    async takeSmartCameraPicture(option?: PictureOptions): Promise<MediaObject> {
-        return this.createMediaObject(await this.getClient().jpegSnapshot(), 'image/jpeg');
+    async takeSmartCameraPicture(options?: RequestPictureOptions): Promise<MediaObject> {
+        return this.createMediaObject(await this.getClient().jpegSnapshot(options?.timeout), 'image/jpeg');
     }
 
     async getUrlSettings(): Promise<Setting[]> {
@@ -330,9 +596,28 @@ class ReolinkCamera extends RtspSmartCamera implements Camera, Reboot, Intercom,
     }
 
     createRtspMediaStreamOptions(url: string, index: number) {
-        const ret = super.createRtspMediaStreamOptions(url, index);
+        const ret = createRtspMediaStreamOptions(url, index);
         ret.tool = 'scrypted';
         return ret;
+    }
+
+    addRtspCredentials(rtspUrl: string) {
+        const url = new URL(rtspUrl);
+        if (url.protocol !== 'rtmp:') {
+            url.username = this.storage.getItem('username');
+            url.password = this.storage.getItem('password') || '';
+        } else {
+            const params = url.searchParams;
+            for (const [k, v] of Object.entries(this.client.parameters)) {
+                params.set(k, v);
+            }
+        }
+        return url.toString();
+    }
+
+    async createVideoStream(vso: UrlMediaStreamOptions): Promise<MediaObject> {
+        await this.client.login();
+        return super.createVideoStream(vso);
     }
 
     async getConstructedVideoStreamOptions(): Promise<UrlMediaStreamOptions[]> {
@@ -361,7 +646,8 @@ class ReolinkCamera extends RtspSmartCamera implements Camera, Reboot, Intercom,
             this.console.error("Codec query failed. Falling back to known defaults.", e);
         }
 
-        const channel = (this.getRtspChannel() + 1).toString().padStart(2, '0');
+        const rtspChannel = this.getRtspChannel();
+        const channel = (rtspChannel + 1).toString().padStart(2, '0');
 
         const streams: UrlMediaStreamOptions[] = [
             {
@@ -401,26 +687,79 @@ class ReolinkCamera extends RtspSmartCamera implements Camera, Reboot, Intercom,
             }
         ];
 
-        if (deviceInfo?.model == "Reolink TrackMix PoE") {
+        // abilityChn->live
+        // 0: not support
+        // 1: support main/extern/sub stream
+        // 2: support main/sub stream
+
+        const live = this.storageSettings.values.abilities?.value?.Ability?.abilityChn?.[rtspChannel].live?.ver;
+        const [rtmpMain, rtmpExt, rtmpSub, rtspMain, rtspSub] = streams;
+        streams.splice(0, streams.length);
+
+        // abilityChn->mainEncType
+        // 0: main stream enc type is H264
+        // 1: main stream enc type is H265
+
+        // anecdotally, encoders of type h265 do not have a working RTMP main stream.
+        const mainEncType = this.storageSettings.values.abilities?.value?.Ability?.abilityChn?.[rtspChannel].mainEncType?.ver;
+
+        if (live === 2) {
+            if (mainEncType === 1) {
+                streams.push(rtmpSub, rtspMain, rtspSub);
+            }
+            else {
+                streams.push(rtmpMain, rtmpSub, rtspMain, rtspSub);
+            }
+        }
+        else if (mainEncType === 1) {
+            streams.push(rtmpExt, rtmpSub, rtspMain, rtspSub);
+        }
+        else {
+            streams.push(rtmpMain, rtmpExt, rtmpSub, rtspMain, rtspSub);
+        }
+
+
+        // https://github.com/starkillerOG/reolink_aio/blob/main/reolink_aio/api.py#L93C1-L97C2
+        // single motion models have 2*2 RTSP channels
+        if (deviceInfo?.model &&
+            [
+                "Reolink TrackMix PoE",
+                "Reolink TrackMix WiFi",
+                "RLC-81MA",
+                "Trackmix Series W760"
+            ].includes(deviceInfo?.model)) {
             streams.push({
                 name: '',
                 id: 'autotrack.bcs',
                 container: 'rtmp',
                 video: { width: 896, height: 512 },
-                url: ''
+                url: '',
+            });
 
-            })
+            if (rtspChannel === 0) {
+                streams.push({
+                    name: '',
+                    id: `h264Preview_02_main`,
+                    container: 'rtsp',
+                    video: { codec: 'h264', width: 3840, height: 2160 },
+                    url: ''
+                }, {
+                    name: '',
+                    id: `h264Preview_02_sub`,
+                    container: 'rtsp',
+                    video: { codec: 'h264', width: 640, height: 480 },
+                    url: ''
+                })
+            }
         }
 
         for (const stream of streams) {
             var streamUrl;
             if (stream.container === 'rtmp') {
-                streamUrl = new URL(`rtmp://${this.getRtmpAddress()}/bcs/channel${this.getRtspChannel()}_${stream.id}`)
+                streamUrl = new URL(`rtmp://${this.getRtmpAddress()}/bcs/channel${rtspChannel}_${stream.id}`)
                 const params = streamUrl.searchParams;
-                params.set("channel", this.getRtspChannel().toString())
+                params.set("channel", rtspChannel.toString())
                 params.set("stream", '0')
-                params.set("user", this.getUsername())
-                params.set("password", this.getPassword())
                 stream.url = streamUrl.toString();
                 stream.name = `RTMP ${stream.id}`;
             } else if (stream.container === 'rtsp') {
@@ -456,7 +795,6 @@ class ReolinkCamera extends RtspSmartCamera implements Camera, Reboot, Intercom,
         }
 
         return streams;
-
     }
 
     async putSetting(key: string, value: string) {
@@ -478,23 +816,94 @@ class ReolinkCamera extends RtspSmartCamera implements Camera, Reboot, Intercom,
     async getRtspPortOverrideSettings(): Promise<Setting[]> {
         return [
             ...await super.getRtspPortOverrideSettings(),
+        ];
+    }
+
+    async getOtherSettings(): Promise<Setting[]> {
+        const ret = await super.getOtherSettings();
+        return [
             ...await this.storageSettings.getSettings(),
-            {
-                key: 'rtmpPort',
-                subgroup: 'Advanced',
-                title: 'RTMP Port Override',
-                placeholder: '1935',
-                value: this.storage.getItem('rtmpPort'),
-            },
+            ...ret,
         ];
     }
 
     getRtmpAddress() {
         return `${this.getIPAddress()}:${this.storage.getItem('rtmpPort') || 1935}`;
     }
+
+    async reportDevices() {
+        const hasSiren = this.hasSiren();
+        const hasFloodlight = this.hasFloodlight();
+
+        const devices: Device[] = [];
+
+        if (hasSiren) {
+            const sirenNativeId = `${this.nativeId}-siren`;
+            const sirenDevice: Device = {
+                providerNativeId: this.nativeId,
+                name: `${this.name} Siren`,
+                nativeId: sirenNativeId,
+                info: {
+                    ...this.info,
+                },
+                interfaces: [
+                    ScryptedInterface.OnOff
+                ],
+                type: ScryptedDeviceType.Siren,
+            };
+
+            devices.push(sirenDevice);
+        }
+
+        if (hasFloodlight) {
+            const floodlightNativeId = `${this.nativeId}-floodlight`;
+            const floodlightDevice: Device = {
+                providerNativeId: this.nativeId,
+                name: `${this.name} Floodlight`,
+                nativeId: floodlightNativeId,
+                info: {
+                    ...this.info,
+                },
+                interfaces: [
+                    ScryptedInterface.OnOff
+                ],
+                type: ScryptedDeviceType.Light,
+            };
+
+            devices.push(floodlightDevice);
+        }
+
+        sdk.deviceManager.onDevicesChanged({
+            providerNativeId: this.nativeId,
+            devices
+        });
+    }
+
+    async getDevice(nativeId: string): Promise<any> {
+        if (nativeId.endsWith('-siren')) {
+            this.siren ||= new ReolinkCameraSiren(this, nativeId);
+            return this.siren;
+        } else if (nativeId.endsWith('-floodlight')) {
+            this.floodlight ||= new ReolinkCameraFloodlight(this, nativeId);
+            return this.floodlight;
+        }
+    }
+
+    async releaseDevice(id: string, nativeId: string) {
+        if (nativeId.endsWith('-siren')) {
+            delete this.siren;
+        } else
+            if (nativeId.endsWith('-floodlight')) {
+                delete this.floodlight;
+            }
+    }
 }
 
-class ReolinkProider extends RtspProvider {
+class ReolinkProvider extends RtspProvider {
+    getScryptedDeviceCreator(): string {
+        return 'Reolink Camera';
+    }
+
     getAdditionalInterfaces() {
         return [
             ScryptedInterface.Reboot,
@@ -509,23 +918,42 @@ class ReolinkProider extends RtspProvider {
         const httpAddress = `${settings.ip}:${settings.httpPort || 80}`;
         let info: DeviceInformation = {};
 
+        const skipValidate = settings.skipValidate?.toString() === 'true';
         const username = settings.username?.toString();
         const password = settings.password?.toString();
-        const doorbell = settings.doorbell?.toString();
-        const skipValidate = settings.skipValidate?.toString() === 'true';
+        let doorbell: boolean = false;
+        let name: string = 'Reolink Camera';
+        let deviceInfo: DevInfo;
+        let ai;
+        let abilities;
         const rtspChannel = parseInt(settings.rtspChannel?.toString()) || 0;
         if (!skipValidate) {
+            const api = new ReolinkCameraClient(httpAddress, username, password, rtspChannel, this.console);
+            const apiWithToken = new ReolinkCameraClient(httpAddress, username, password, rtspChannel, this.console, true);
             try {
-                const api = new ReolinkCameraClient(httpAddress, username, password, rtspChannel, this.console);
                 await api.jpegSnapshot();
-                // there doesn't seem to be a way to get the actual model number information out of their api.
             }
             catch (e) {
                 this.console.error('Error adding Reolink camera', e);
                 throw e;
             }
+
+            try {
+                deviceInfo = await api.getDeviceInfo();
+                doorbell = deviceInfo.type === 'BELL';
+                name = deviceInfo.name ?? 'Reolink Camera';
+                ai = await api.getAiState();
+                try {
+                    abilities = await api.getAbility();
+                } catch (e) {
+                    abilities = await apiWithToken.getAbility();
+                }
+            }
+            catch (e) {
+                this.console.error('Reolink camera does not support AI events', e);
+            }
         }
-        settings.newCamera ||= 'Reolink Camera';
+        settings.newCamera ||= name;
 
         nativeId = await super.createDevice(settings, nativeId);
 
@@ -533,11 +961,15 @@ class ReolinkProider extends RtspProvider {
         device.info = info;
         device.putSetting('username', username);
         device.putSetting('password', password);
-        device.putSetting('doorbell', doorbell)
+        device.storageSettings.values.doorbell = doorbell;
+        device.storageSettings.values.deviceInfo = deviceInfo;
+        device.storageSettings.values.abilities = abilities;
+        device.storageSettings.values.hasObjectDetector = ai;
         device.setIPAddress(settings.ip?.toString());
         device.putSetting('rtspChannel', settings.rtspChannel?.toString());
         device.setHttpPortOverride(settings.httpPort?.toString());
         device.updateDeviceInfo();
+
         return nativeId;
     }
 
@@ -558,12 +990,7 @@ class ReolinkProider extends RtspProvider {
                 placeholder: '192.168.2.222',
             },
             {
-                key: 'doorbell',
-                title: 'Doorbell',
-                description: 'This camera is a Reolink Doorbell.',
-                type: 'boolean',
-            },
-            {
+                subgroup: 'Advanced',
                 key: 'rtspChannel',
                 title: 'Channel Number Override',
                 description: "Optional: The channel number to use for snapshots and video. E.g., 0, 1, 2, etc.",
@@ -571,12 +998,14 @@ class ReolinkProider extends RtspProvider {
                 type: 'number',
             },
             {
+                subgroup: 'Advanced',
                 key: 'httpPort',
                 title: 'HTTP Port',
-                description: 'Optional: Override the HTTP Port from the default value of 80',
+                description: 'Optional: Override the HTTP Port from the default value of 80.',
                 placeholder: '80',
             },
             {
+                subgroup: 'Advanced',
                 key: 'skipValidate',
                 title: 'Skip Validation',
                 description: 'Add the device without verifying the credentials and network settings.',
@@ -590,4 +1019,4 @@ class ReolinkProider extends RtspProvider {
     }
 }
 
-export default ReolinkProider;
+export default ReolinkProvider;

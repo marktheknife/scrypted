@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
 
+if [ "$SCRYPTED_LXC" ]
+then
+    export SERVICE_USER="root"
+    export SCRYPTED_NONINTERACTIVE="true"
+fi
+
 if [ -z "$SERVICE_USER" ]
 then
     echo "Scrypted SERVICE_USER environment variable was not specified. Service will not be installed."
@@ -7,6 +13,12 @@ then
 fi
 
 function readyn() {
+    if [ ! -z "$SCRYPTED_NONINTERACTIVE" ]
+    then
+        yn="y"
+        return
+    fi
+
     while true; do
         read -p "$1 (y/n) " yn
         case $yn in
@@ -33,6 +45,11 @@ systemctl disable scrypted.service 2> /dev/null
 USER_HOME=$(eval echo ~$SERVICE_USER)
 SCRYPTED_HOME=$USER_HOME/.scrypted
 mkdir -p $SCRYPTED_HOME
+# remove various things from a previous local install.
+rm -rf $SCRYPTED_HOME/node_modules
+rm -rf $SCRYPTED_HOME/install.json
+rm -rf $SCRYPTED_HOME/package.json
+rm -rf $SCRYPTED_HOME/package-lock.json
 
 set -e
 cd $SCRYPTED_HOME
@@ -46,17 +63,48 @@ then
     usermod -aG docker $SERVICE_USER
 fi
 
-WATCHTOWER_HTTP_API_TOKEN=$(echo $RANDOM | md5sum)
+WATCHTOWER_HTTP_API_TOKEN=$(echo $RANDOM | md5sum | head -c 32)
+echo "WATCHTOWER_HTTP_API_TOKEN=$WATCHTOWER_HTTP_API_TOKEN" > $SCRYPTED_HOME/.env
+# remove the following line from .env to disable autoupdates.
+# this is not recommended.
+echo "WATCHTOWER_HTTP_API_PERIODIC_POLLS=true" >> $SCRYPTED_HOME/.env
+
 DOCKER_COMPOSE_YML=$SCRYPTED_HOME/docker-compose.yml
+curl -s https://raw.githubusercontent.com/koush/scrypted/main/install/docker/docker-compose.yml > $DOCKER_COMPOSE_YML
 echo "Created $DOCKER_COMPOSE_YML"
-curl -s https://raw.githubusercontent.com/koush/scrypted/main/install/docker/docker-compose.yml | sed s/SET_THIS_TO_SOME_RANDOM_TEXT/"$(echo $RANDOM | md5sum | head -c 32)"/g > $DOCKER_COMPOSE_YML
-if [ -d /dev/dri ]
+
+if [ -z "$SCRYPTED_LXC" ]
 then
-    sed -i 's/'#' "\/dev\/dri/"\/dev\/dri/g' $DOCKER_COMPOSE_YML
+    if [ -e /dev/dri ]
+    then
+        sed -i 's/'#' "\/dev\/dri/"\/dev\/dri/g' $DOCKER_COMPOSE_YML
+    fi
+    if [ -e /dev/kfd ]
+    then
+        sed -i 's/'#' "\/dev\/kfd/"\/dev\/kfd/g' $DOCKER_COMPOSE_YML
+    fi
+else
+    # uncomment lxc specific stuff
+    sed -i 's/'#' lxc //g' $DOCKER_COMPOSE_YML
+    # never restart, systemd will handle it
+    sed -i 's/restart: unless-stopped/restart: no/g' $DOCKER_COMPOSE_YML
+
+    sudo systemctl stop apparmor || true
+    sudo apt -y purge apparmor || true
+fi
+
+readyn "Install avahi-daemon? This is the recommended for reliable HomeKit discovery and pairing."
+if [ "$yn" == "y" ]
+then
+    sudo apt-get -y install avahi-daemon
+    sed -i 's/'#' - \/var\/run\/dbus/- \/var\/run\/dbus/g' $DOCKER_COMPOSE_YML
+    sed -i 's/'#' - \/var\/run\/avahi-daemon/- \/var\/run\/avahi-daemon/g' $DOCKER_COMPOSE_YML
+    sed -i 's/'#' security_opt:/security_opt:/g' $DOCKER_COMPOSE_YML
+    sed -i 's/'#'     - apparmor:unconfined/    - apparmor:unconfined/g' $DOCKER_COMPOSE_YML
 fi
 
 echo "Setting permissions on $SCRYPTED_HOME"
-chown -R $SERVICE_USER $SCRYPTED_HOME
+chown -R $SERVICE_USER $SCRYPTED_HOME || true
 
 set +e
 
@@ -69,8 +117,41 @@ set -e
 
 echo "docker compose pull"
 sudo -u $SERVICE_USER docker compose pull
-echo "docker compose up -d"
-sudo -u $SERVICE_USER docker compose up -d
+
+if [ -z "$SCRYPTED_LXC" ]
+then
+    echo "docker compose up -d"
+    sudo -u $SERVICE_USER docker compose up -d
+else
+    export DOCKER_COMPOSE_SH=$SCRYPTED_HOME/docker-compose.sh
+
+    curl https://raw.githubusercontent.com/koush/scrypted/main/install/proxmox/docker-compose.sh > $DOCKER_COMPOSE_SH
+
+    chmod +x $DOCKER_COMPOSE_SH
+
+    cat > /etc/systemd/system/scrypted.service <<EOT
+[Unit]
+Description=Scrypted service
+After=network.target
+
+[Service]
+User=root
+Group=root
+Type=simple
+ExecStart=$DOCKER_COMPOSE_SH
+Restart=always
+RestartSec=3
+StandardOutput=null
+StandardError=null
+
+[Install]
+WantedBy=multi-user.target
+EOT
+
+    systemctl daemon-reload
+    systemctl enable scrypted.service
+    systemctl restart scrypted.service
+fi
 
 echo
 echo
@@ -81,5 +162,5 @@ echo "Note that it is https and that you'll be asked to approve/ignore the websi
 echo
 echo
 echo "Optional:"
-echo "Scrypted NVR Recording storage directory can be configured with an additional script:"
-echo "https://docs.scrypted.app/scrypted-nvr/installation.html#docker-volume"
+echo "Scrypted NVR Recording storage directory can be configured with an additional script located at:"
+echo "https://docs.scrypted.app/scrypted-nvr/recording-storage.html#docker-volume"

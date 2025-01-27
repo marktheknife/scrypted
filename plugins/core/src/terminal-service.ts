@@ -1,19 +1,30 @@
-import { ScryptedDeviceBase, ScryptedNativeId, StreamService } from "@scrypted/sdk";
-import type { IPty, spawn as ptySpawn } from 'node-pty-prebuilt-multiarch';
+import sdk, { ScryptedDeviceBase, ScryptedInterface, ScryptedNativeId, StreamService, TTYSettings } from "@scrypted/sdk";
+import type { IPty, spawn as ptySpawn } from 'node-pty';
 import { createAsyncQueue } from '@scrypted/common/src/async-queue'
 import { ChildProcess, spawn as childSpawn } from "child_process";
+import path from 'path';
 
 export const TerminalServiceNativeId = 'terminalservice';
 
+const { systemManager } = sdk;
+
+function toSpawnPathEnv(paths: string[]): string {
+    const existingPath = process.env.PATH;
+    const extraPaths = paths.join(path.delimiter);
+    if (existingPath && extraPaths)
+        return `${extraPaths}${path.delimiter}${existingPath}`;
+    return extraPaths || existingPath;
+}
 
 class InteractiveTerminal {
     cp: IPty
 
-    constructor(cmd: string[], spawn: typeof ptySpawn) {
+    constructor(cmd: string[], paths: string[], spawn: typeof ptySpawn) {
+        const spawnPath = toSpawnPathEnv(paths);
         if (cmd?.length) {
-            this.cp = spawn(cmd[0], cmd.slice(1), {});
+            this.cp = spawn(cmd[0], cmd.slice(1), { env: { ...process.env, PATH: spawnPath } });
         } else {
-            this.cp = spawn(process.env.SHELL as string, [], {});
+            this.cp = spawn(process.env.SHELL as string, [], { env: { ...process.env, PATH: spawnPath } });
         }
     }
 
@@ -54,11 +65,12 @@ class InteractiveTerminal {
 class NoninteractiveTerminal {
     cp: ChildProcess
 
-    constructor(cmd: string[]) {
+    constructor(cmd: string[], paths: string[]) {
+        const spawnPath = toSpawnPathEnv(paths);
         if (cmd?.length) {
-            this.cp = childSpawn(cmd[0], cmd.slice(1));
+            this.cp = childSpawn(cmd[0], cmd.slice(1), { env: { ...process.env, PATH: spawnPath } });
         } else {
-            this.cp = childSpawn(process.env.SHELL as string);
+            this.cp = childSpawn(process.env.SHELL as string, { env: { ...process.env, PATH: spawnPath } });
         }
     }
 
@@ -99,9 +111,27 @@ class NoninteractiveTerminal {
 }
 
 
-export class TerminalService extends ScryptedDeviceBase implements StreamService {
+export class TerminalService extends ScryptedDeviceBase implements StreamService<Buffer | string, Buffer> {
     constructor(nativeId?: ScryptedNativeId) {
-        super(TerminalServiceNativeId);
+        super(nativeId);
+    }
+
+    async getExtraPaths(): Promise<string[]> {
+        let extraPaths: string[] = [];
+        const state = systemManager.getSystemState();
+        for (const id in state) {
+            const device = systemManager.getDeviceById<TTYSettings>(id);
+            if (device.interfaces.includes(ScryptedInterface.TTYSettings)) {
+                try {
+                    const ttySettings = await device.getTTYSettings();
+                    extraPaths = extraPaths.concat(ttySettings.paths || []);
+                }
+                catch (e) {
+                    this.console.log(e);
+                }
+            }
+        }
+        return extraPaths;
     }
 
     /*
@@ -114,9 +144,10 @@ export class TerminalService extends ScryptedDeviceBase implements StreamService
      *   Resize: { "dim": { "cols": number, "rows": number } }
      *   EOF: { "eof": true }
      */
-    async connectStream(input: AsyncGenerator<Buffer | string, void>): Promise<AsyncGenerator<Buffer, void>> {
+    async connectStream(input: AsyncGenerator<Buffer | string, void>, options?: any): Promise<AsyncGenerator<Buffer, void>> {
         let cp: InteractiveTerminal | NoninteractiveTerminal = null;
         const queue = createAsyncQueue<Buffer>();
+        const extraPaths = await this.getExtraPaths();
 
         function registerChildListeners() {
             cp.onExit(() => queue.end());
@@ -171,10 +202,12 @@ export class TerminalService extends ScryptedDeviceBase implements StreamService
                         } else if (parsed.eof) {
                             cp?.sendEOF();
                         } else if ("interactive" in parsed && !cp) {
+                            const cmd = parsed.cmd || options?.cmd;
                             if (parsed.interactive) {
+                                let spawn: typeof ptySpawn;
                                 try {
-                                    const spawn = require('node-pty-prebuilt-multiarch').spawn as typeof ptySpawn;
-                                    cp = new InteractiveTerminal(parsed.cmd, spawn);
+                                    spawn = require('@scrypted/node-pty').spawn as typeof ptySpawn;
+                                    cp = new InteractiveTerminal(cmd, extraPaths, spawn);
                                 }
                                 catch (e) {
                                     this.console.error('Error starting pty', e);
@@ -182,7 +215,7 @@ export class TerminalService extends ScryptedDeviceBase implements StreamService
                                     return;
                                 }
                             } else {
-                                cp = new NoninteractiveTerminal(parsed.cmd);
+                                cp = new NoninteractiveTerminal(cmd, extraPaths);
                             }
                             registerChildListeners();
                         }

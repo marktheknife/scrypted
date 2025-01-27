@@ -1,6 +1,7 @@
 export * from '../types/gen/index';
 import type { DeviceManager, DeviceState, EndpointManager, EventListenerRegister, Logger, MediaManager, MediaObject, ScryptedInterface, ScryptedNativeId, ScryptedStatic, SystemManager, WritableDeviceState } from '../types/gen/index';
 import { DeviceBase, ScryptedInterfaceDescriptors, ScryptedInterfaceProperty, TYPES_VERSION } from '../types/gen/index';
+import { createRequire } from 'module';
 
 /**
  * @category Core Reference
@@ -17,28 +18,28 @@ export class ScryptedDeviceBase extends DeviceBase {
 
   get storage() {
     if (!this._storage) {
-      this._storage = deviceManager.getDeviceStorage(this.nativeId);
+      this._storage = sdk.deviceManager.getDeviceStorage(this.nativeId);
     }
     return this._storage;
   }
 
   get log() {
     if (!this._log) {
-      this._log = deviceManager.getDeviceLogger(this.nativeId);
+      this._log = sdk.deviceManager.getDeviceLogger(this.nativeId);
     }
     return this._log;
   }
 
   get console() {
     if (!this._console) {
-      this._console = deviceManager.getDeviceConsole(this.nativeId);
+      this._console = sdk.deviceManager.getDeviceConsole(this.nativeId);
     }
 
     return this._console;
   }
 
   async createMediaObject(data: any, mimeType: string) {
-    return mediaManager.createMediaObject(data, mimeType, {
+    return sdk.mediaManager.createMediaObject(data, mimeType, {
       sourceId: this.id,
     });
   }
@@ -46,16 +47,16 @@ export class ScryptedDeviceBase extends DeviceBase {
   getMediaObjectConsole(mediaObject: MediaObject): Console | undefined {
     if (typeof mediaObject.sourceId !== 'string')
       return this.console;
-    return deviceManager.getMixinConsole(mediaObject.sourceId, this.nativeId);
+    return sdk.deviceManager.getMixinConsole(mediaObject.sourceId, this.nativeId);
   }
 
   _lazyLoadDeviceState() {
     if (!this._deviceState) {
       if (this.nativeId) {
-        this._deviceState = deviceManager.getDeviceState(this.nativeId);
+        this._deviceState = sdk.deviceManager.getDeviceState(this.nativeId);
       }
       else {
-        this._deviceState = deviceManager.getDeviceState();
+        this._deviceState = sdk.deviceManager.getDeviceState();
       }
     }
   }
@@ -64,7 +65,7 @@ export class ScryptedDeviceBase extends DeviceBase {
    * Fire an event for this device.
    */
   onDeviceEvent(eventInterface: string, eventData: any): Promise<void> {
-    return deviceManager.onDeviceEvent(this.nativeId, eventInterface, eventData);
+    return sdk.deviceManager.onDeviceEvent(this.nativeId, eventInterface, eventData);
   }
 }
 
@@ -82,7 +83,7 @@ export interface MixinDeviceOptions<T> {
 /**
  * @category Mixin Reference
  */
- export class MixinDeviceBase<T> extends DeviceBase implements DeviceState {
+export class MixinDeviceBase<T> extends DeviceBase implements DeviceState {
   mixinProviderNativeId: ScryptedNativeId;
   mixinDevice: T;
   mixinDeviceInterfaces: ScryptedInterface[];
@@ -96,43 +97,43 @@ export interface MixinDeviceOptions<T> {
   constructor(options: MixinDeviceOptions<T>) {
     super();
 
-    this.nativeId = systemManager.getDeviceById(this.id).nativeId;
     this.mixinDevice = options.mixinDevice;
     this.mixinDeviceInterfaces = options.mixinDeviceInterfaces;
     this.mixinStorageSuffix = options.mixinStorageSuffix;
     this._deviceState = options.mixinDeviceState;
-    // 8-11-2022
+    this.nativeId = sdk.systemManager.getDeviceById(this.id).nativeId;
+    this.mixinProviderNativeId = options.mixinProviderNativeId;
+
     // RpcProxy will trap all properties, and the following check/hack will determine
     // if the device state came from another node worker thread.
-    // This should ultimately be removed at some point in the future.
-    if ((this._deviceState as any).__rpcproxy_traps_all_properties && deviceManager.createDeviceState && typeof this._deviceState.id === 'string') {
-      this._deviceState = deviceManager.createDeviceState(this._deviceState.id, this._deviceState.setState);
+    // This should ultimately be discouraged and warned at some point in the future.
+    if ((this._deviceState as any).__rpcproxy_traps_all_properties && typeof this._deviceState.id === 'string') {
+      this._deviceState = sdk.deviceManager.createDeviceState(this._deviceState.id, this._deviceState.setState);
     }
-    this.mixinProviderNativeId = options.mixinProviderNativeId;
   }
 
   get storage() {
     if (!this._storage) {
       const mixinStorageSuffix = this.mixinStorageSuffix;
       const mixinStorageKey = this.id + (mixinStorageSuffix ? ':' + mixinStorageSuffix : '');
-      this._storage = deviceManager.getMixinStorage(mixinStorageKey, this.mixinProviderNativeId);
+      this._storage = sdk.deviceManager.getMixinStorage(mixinStorageKey, this.mixinProviderNativeId);
     }
     return this._storage;
   }
 
   get console() {
     if (!this._console) {
-      if (deviceManager.getMixinConsole)
-        this._console = deviceManager.getMixinConsole(this.id, this.mixinProviderNativeId);
+      if (sdk.deviceManager.getMixinConsole)
+        this._console = sdk.deviceManager.getMixinConsole(this.id, this.mixinProviderNativeId);
       else
-        this._console = deviceManager.getDeviceConsole(this.mixinProviderNativeId);
+        this._console = sdk.deviceManager.getDeviceConsole(this.mixinProviderNativeId);
     }
 
     return this._console;
   }
 
   async createMediaObject(data: any, mimeType: string) {
-    return mediaManager.createMediaObject(data, mimeType, {
+    return sdk.mediaManager.createMediaObject(data, mimeType, {
       sourceId: this.id,
     });
   }
@@ -140,14 +141,14 @@ export interface MixinDeviceOptions<T> {
   getMediaObjectConsole(mediaObject: MediaObject): Console {
     if (typeof mediaObject.sourceId !== 'string')
       return this.console;
-    return deviceManager.getMixinConsole(mediaObject.sourceId, this.mixinProviderNativeId);
+    return sdk.deviceManager.getMixinConsole(mediaObject.sourceId, this.mixinProviderNativeId);
   }
 
   /**
    * Fire an event for this device.
    */
   onDeviceEvent(eventInterface: string, eventData: any): Promise<void> {
-    return deviceManager.onMixinEvent(this.id, this, eventInterface, eventData);
+    return sdk.deviceManager.onMixinEvent(this.id, this, eventInterface, eventData);
   }
 
   _lazyLoadDeviceState() {
@@ -165,23 +166,25 @@ export interface MixinDeviceOptions<T> {
 }
 
 (function () {
-  function _createGetState<T>(deviceBase: ScryptedDeviceBase | MixinDeviceBase<T>, state: ScryptedInterfaceProperty) {
-    return function () {
-      deviceBase._lazyLoadDeviceState();
+  function _createGetState(state: ScryptedInterfaceProperty) {
+    return function <T>(this: ScryptedDeviceBase | MixinDeviceBase<T>) {
+      this._lazyLoadDeviceState();
       // @ts-ignore: accessing private property
-      return deviceBase._deviceState?.[state];
+      return this._deviceState?.[state];
     };
   }
 
-  function _createSetState<T>(deviceBase: ScryptedDeviceBase | MixinDeviceBase<T>, state: ScryptedInterfaceProperty) {
-    return function (value: any) {
-      deviceBase._lazyLoadDeviceState();
+  function _createSetState(state: ScryptedInterfaceProperty) {
+    return function <T>(this: ScryptedDeviceBase | MixinDeviceBase<T>, value: any) {
+      this._lazyLoadDeviceState();
       // @ts-ignore: accessing private property
-      if (!deviceBase._deviceState)
+      if (!this._deviceState) {
         console.warn('device state is unavailable. the device must be discovered with deviceManager.onDeviceDiscovered or deviceManager.onDevicesChanged before the state can be set.');
-      else
-      // @ts-ignore: accessing private property
-        deviceBase._deviceState[state] = value;
+      }
+      else {
+        // @ts-ignore: accessing private property
+        this._deviceState[state] = value;
+      }
     };
   }
 
@@ -189,44 +192,81 @@ export interface MixinDeviceOptions<T> {
     if (field === ScryptedInterfaceProperty.nativeId)
       continue;
     Object.defineProperty(ScryptedDeviceBase.prototype, field, {
-      set: _createSetState(ScryptedDeviceBase.prototype, field),
-      get: _createGetState(ScryptedDeviceBase.prototype, field),
+      set: _createSetState(field),
+      get: _createGetState(field),
     });
     Object.defineProperty(MixinDeviceBase.prototype, field, {
-      set: _createSetState(MixinDeviceBase.prototype, field),
-      get: _createGetState(MixinDeviceBase.prototype, field),
+      set: _createSetState(field),
+      get: _createGetState(field),
     });
   }
 })();
 
-export const sdk: ScryptedStatic = {} as any;
 declare const deviceManager: DeviceManager;
 declare const endpointManager: EndpointManager;
 declare const mediaManager: MediaManager;
 declare const systemManager: SystemManager;
 declare const pluginHostAPI: any;
 declare const pluginRuntimeAPI: any;
+export const sdk: ScryptedStatic = {} as any;
 
 try {
-  let runtimeAPI: any;
+  let loaded = false;
   try {
-    runtimeAPI = pluginRuntimeAPI;
+    // todo: remove usage of process.env.SCRYPTED_SDK_MODULE, only existed in prerelease builds.
+    // import.meta is not a reliable way to detect es module support in webpack since webpack
+    // evaluates that to true at runtime.
+    const esModule = process.env.SCRYPTED_SDK_ES_MODULE || process.env.SCRYPTED_SDK_MODULE;
+    const cjsModule = process.env.SCRYPTED_SDK_CJS_MODULE || process.env.SCRYPTED_SDK_MODULE;
+    // @ts-expect-error
+    if (esModule && typeof import.meta !== 'undefined') {
+      // @ts-expect-error
+      const require = createRequire(import.meta.url);
+      const sdkModule = require(esModule);
+      Object.assign(sdk, sdkModule.getScryptedStatic());
+      loaded = true;
+    }
+    else if (cjsModule) {
+      // @ts-expect-error
+      if (typeof __non_webpack_require__ !== 'undefined') {
+        // @ts-expect-error
+        const sdkModule = __non_webpack_require__(process.env.SCRYPTED_SDK_MODULE);
+        Object.assign(sdk, sdkModule.getScryptedStatic());
+        loaded = true;
+      }
+      else {
+        const sdkModule = require(cjsModule);
+        Object.assign(sdk, sdkModule.getScryptedStatic());
+        loaded = true;
+      }
+    }
   }
   catch (e) {
+    console.warn("failed to load sdk module", e);
+    throw e;
   }
 
-  Object.assign(sdk, {
-    log: deviceManager.getDeviceLogger(undefined),
-    deviceManager,
-    endpointManager,
-    mediaManager,
-    systemManager,
-    pluginHostAPI,
-    ...runtimeAPI,
-  });
+  if (!loaded) {
+    let runtimeAPI: any;
+    try {
+      runtimeAPI = pluginRuntimeAPI;
+    }
+    catch (e) {
+    }
+
+    Object.assign(sdk, {
+      log: deviceManager.getDeviceLogger(undefined),
+      deviceManager,
+      endpointManager,
+      mediaManager,
+      systemManager,
+      pluginHostAPI,
+      ...runtimeAPI,
+    });
+  }
 
   try {
-    (systemManager as any).setScryptedInterfaceDescriptors?.(TYPES_VERSION, ScryptedInterfaceDescriptors)?.catch(() => { });
+    (sdk.systemManager as any).setScryptedInterfaceDescriptors?.(TYPES_VERSION, ScryptedInterfaceDescriptors)?.catch(() => { });
   }
   catch (e) {
   }
@@ -236,3 +276,4 @@ catch (e) {
 }
 
 export default sdk;
+

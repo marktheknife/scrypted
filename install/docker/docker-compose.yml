@@ -1,5 +1,3 @@
-version: "3.5"
-
 # The Scrypted docker-compose.yml file typically resides at:
 # ~/.scrypted/docker-compose.yml
 
@@ -21,6 +19,9 @@ version: "3.5"
 
 services:
     scrypted:
+        # LXC usage only
+        # lxc privileged: true
+
         environment:
             # Scrypted NVR Storage (Part 2 of 3)
 
@@ -31,24 +32,30 @@ services:
             # section below.
             # - SCRYPTED_NVR_VOLUME=/nvr
 
-            - SCRYPTED_WEBHOOK_UPDATE_AUTHORIZATION=Bearer SET_THIS_TO_SOME_RANDOM_TEXT
+            - SCRYPTED_WEBHOOK_UPDATE_AUTHORIZATION=Bearer ${WATCHTOWER_HTTP_API_TOKEN:-env_missing_fallback}
             - SCRYPTED_WEBHOOK_UPDATE=http://localhost:10444/v1/update
 
-            # Uncomment next line to run avahi-daemon inside the container
-            # Don't use if dbus and avahi run on the host and are bind-mounted
-            # (see below under "volumes")
+            # LXC usage only
+            # lxc - SCRYPTED_INSTALL_ENVIRONMENT=lxc-docker
+
+            # Avahi can be used for network discovery by passing in the host daemon
+            # or running the daemon inside the container. Choose one or the other.
+            # Uncomment next line to run avahi-daemon inside the container.
+            # See volumes and security_opt section below to use the host daemon.
             # - SCRYPTED_DOCKER_AVAHI=true
 
-            # Uncomment next 3 lines for Nvidia GPU support.
-            # - NVIDIA_VISIBLE_DEVICES=all
-            # - NVIDIA_DRIVER_CAPABILITIES=all
+        # NVIDIA (Part 1 of 2)
         # runtime: nvidia
+
+        # NVIDIA (Part 2 of 2) - Use NVIDIA image, and remove subsequent default image.
+        # image: ghcr.io/koush/scrypted:nvidia
+        image: ghcr.io/koush/scrypted
 
         volumes:
             # Scrypted NVR Storage (Part 3 of 3)
 
             # Modify to add the additional volume for Scrypted NVR.
-            # The following example would mount the /mnt/sda/video path on the host
+            # The following example would mount the /mnt/media/video path on the host
             # to the /nvr path inside the docker container.
             # - /mnt/media/video:/nvr
 
@@ -59,14 +66,29 @@ services:
             #   volume:
             #     nocopy: true
 
-            # uncomment the following lines to expose Avahi, an mDNS advertiser.
-            # make sure Avahi is running on the host machine, otherwise this will not work.
-            # not compatible with Avahi enabled via SCRYPTED_DOCKER_AVAHI=true
+            # Uncomment the following lines to use Avahi daemon from the host.
+            # Ensure Avahi is running on the host machine:
+            # It can be installed with: sudo apt-get install avahi-daemon
+            # This is not compatible with running avahi inside the container (see above).
+            # Also, uncomment the lines under security_opt
             # - /var/run/dbus:/var/run/dbus
             # - /var/run/avahi-daemon/socket:/var/run/avahi-daemon/socket
 
             # Default volume for the Scrypted database. Typically should not be changed.
-            - ~/.scrypted/volume:/server/volume
+            # The volume will be placed relative to this docker-compose.yml.
+            - ./volume:/server/volume
+
+            # LXC usage only
+            # lxc - /var/run/docker.sock:/var/run/docker.sock
+            # lxc - /root/.scrypted/docker-compose.yml:/root/.scrypted/docker-compose.yml
+            # lxc - /root/.scrypted/docker-compose.sh:/root/.scrypted/docker-compose.sh
+            # lxc - /root/.scrypted/.env:/root/.scrypted/.env
+            # lxc - /mnt:/mnt
+
+        # Uncomment the following lines to use Avahi daemon from the host
+        # Without this, AppArmor will block the container's attempt to talk to Avahi via dbus
+        # security_opt:
+        #     - apparmor:unconfined
         devices: [
             # uncomment the common systems devices to pass
             # them through to docker.
@@ -76,6 +98,9 @@ services:
 
             # hardware accelerated video decoding, opencl, etc.
             # "/dev/dri:/dev/dri",
+
+            # AMD GPU
+            # "/dev/kfd:/dev/kfd",
 
             # uncomment below as necessary.
             # zwave usb serial device
@@ -90,27 +115,26 @@ services:
         container_name: scrypted
         restart: unless-stopped
         network_mode: host
-        image: ghcr.io/koush/scrypted
 
         # logging is noisy and will unnecessarily wear on flash storage.
         # scrypted has per device in memory logging that is preferred.
+        # enable the log file if enhanced debugging is necessary.
         logging:
-            driver: "json-file"
-            options:
-                max-size: "10m"
-                max-file: "10"
+            driver: "none"
+            # driver: "json-file"
+            # options:
+            #     max-size: "10m"
+            #     max-file: "10"
         labels:
             - "com.centurylinklabs.watchtower.scope=scrypted"
 
     # watchtower manages updates for Scrypted.
     watchtower:
         environment:
-            - WATCHTOWER_HTTP_API_TOKEN=SET_THIS_TO_SOME_RANDOM_TEXT
+            - WATCHTOWER_HTTP_API_TOKEN=${WATCHTOWER_HTTP_API_TOKEN:-env_missing_fallback}
             - WATCHTOWER_HTTP_API_UPDATE=true
             - WATCHTOWER_SCOPE=scrypted
-            # remove the following line to never allow docker to auto update.
-            # this is not recommended.
-            - WATCHTOWER_HTTP_API_PERIODIC_POLLS=true
+            - WATCHTOWER_HTTP_API_PERIODIC_POLLS=${WATCHTOWER_HTTP_API_PERIODIC_POLLS:-true}
         image: containrrr/watchtower
         container_name: scrypted-watchtower
         restart: unless-stopped

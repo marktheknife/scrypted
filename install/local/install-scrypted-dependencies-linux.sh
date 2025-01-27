@@ -97,7 +97,7 @@ echo "docker compose rm -rf"
 sudo -u $SERVICE_USER docker rm -f /scrypted /scrypted-watchtower 2> /dev/null
 
 echo "Installing Scrypted..."
-RUN sudo -u $SERVICE_USER npx -y scrypted@latest install-server
+RUN sudo -u $SERVICE_USER npx -y scrypted@latest install-server $SCRYPTED_INSTALL_VERSION
 
 cat > /etc/systemd/system/scrypted.service <<EOT
 
@@ -110,10 +110,12 @@ User=$SERVICE_USER
 Group=$SERVICE_USER
 Type=simple
 ExecStart=/usr/bin/npx -y scrypted serve
-Restart=on-failure
+Restart=always
 RestartSec=3
 Environment="NODE_OPTIONS=$NODE_OPTIONS"
 Environment="SCRYPTED_INSTALL_ENVIRONMENT=$SCRYPTED_INSTALL_ENVIRONMENT"
+StandardOutput=null
+StandardError=null
 
 [Install]
 WantedBy=multi-user.target

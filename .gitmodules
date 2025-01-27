@@ -1,15 +1,6 @@
 [submodule "plugins/unifi-protect/src/unifi-protect"]
 	path = external/unifi-protect
 	url = ../../koush/unifi-protect.git
-[submodule "plugins/myq/src/myq"]
-	path = plugins/myq/src/myq
-	url = ../../koush/myq.git
-[submodule "plugins/tensorflow/face-api.js"]
-	path = external/face-api.js
-	url = ../../koush/face-api.js
-[submodule "external/scrypted-ffmpeg"]
-	path = external/scrypted-ffmpeg
-	url = ../../koush/scrypted-ffmpeg
 [submodule "external/ring-client-api"]
 	path = external/ring-client-api
 	url = ../../koush/ring
@@ -20,12 +11,6 @@
 [submodule "external/werift"]
 	path = external/werift
 	url = ../../koush/werift-webrtc
-[submodule "plugins/zwave/file-stream-rotator"]
-	path = plugins/zwave/file-stream-rotator
-	url = ../../koush/file-stream-rotator.git
-[submodule "sdk/developer.scrypted.app"]
-	path = sdk/developer.scrypted.app
-	url = ../../koush/developer.scrypted.app
 [submodule "plugins/sample-cameraprovider"]
 	path = plugins/sample-cameraprovider
 	url = ../../koush/scrypted-sample-cameraprovider
@@ -35,6 +20,3 @@
 [submodule "plugins/wyze/docker-wyze-bridge"]
 	path = plugins/wyze/docker-wyze-bridge
 	url = ../../koush/docker-wyze-bridge.git
-[submodule "plugins/onvif/onvif"]
-	path = plugins/onvif/onvif
-	url = ../../koush/onvif.git

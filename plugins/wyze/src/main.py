@@ -11,6 +11,7 @@ import sys
 import threading
 import time
 import traceback
+import socket
 import urllib
 import urllib.request
 from ctypes import c_int
@@ -28,7 +29,7 @@ from scrypted_sdk.types import (DeviceProvider, PanTiltZoom,
 import wyzecam
 import wyzecam.api_models
 from wyzecam import tutk_protocol
-from wyzecam.api import RateLimitError, post_v2_device
+from wyzecam.api import RateLimitError, post_device
 from wyzecam.tutk.tutk import FRAME_SIZE_2K, FRAME_SIZE_360P, FRAME_SIZE_1080P
 
 os.environ["TUTK_PROJECT_ROOT"] = os.path.join(
@@ -134,7 +135,7 @@ class WyzeCamera(scrypted_sdk.ScryptedDeviceBase, VideoCamera, Settings, PanTilt
         except:
             if default:
                 return "Default"
-            return 120 if self.camera.is_2k else 60
+            return 240 if self.camera.is_2k else 160
 
     async def getSettings(self):
         ret: List[Setting] = []
@@ -151,8 +152,9 @@ class WyzeCamera(scrypted_sdk.ScryptedDeviceBase, VideoCamera, Settings, PanTilt
                     "500",
                     "750",
                     "1000",
-                    "1200",
                     "1400",
+                    "1800",
+                    "2000",
                 ],
             }
         )
@@ -189,9 +191,10 @@ class WyzeCamera(scrypted_sdk.ScryptedDeviceBase, VideoCamera, Settings, PanTilt
         ffmpeg = await scrypted_sdk.mediaManager.getFFmpegPath()
         loop = asyncio.get_event_loop()
 
-        class RFC4571Writer:
+        class RFC4571Writer(asyncio.DatagramProtocol):
             def connection_made(self, transport):
-                pass
+                sock = transport.get_extra_info('socket')
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
 
             def datagram_received(self, data, addr):
                 l = len(data)
@@ -221,7 +224,7 @@ class WyzeCamera(scrypted_sdk.ScryptedDeviceBase, VideoCamera, Settings, PanTilt
             "rtp",
             "-payload_type",
             "96",
-            f"rtp://127.0.0.1:{vport}?pkt_size=1300",
+            f"rtp://127.0.0.1:{vport}?pkt_size=64000",
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
@@ -258,7 +261,7 @@ class WyzeCamera(scrypted_sdk.ScryptedDeviceBase, VideoCamera, Settings, PanTilt
                 "rtp",
                 "-payload_type",
                 "97",
-                f"rtp://127.0.0.1:{aport}?pkt_size=1300",
+                f"rtp://127.0.0.1:{aport}?pkt_size=64000",
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
@@ -269,8 +272,18 @@ class WyzeCamera(scrypted_sdk.ScryptedDeviceBase, VideoCamera, Settings, PanTilt
                 p.stdin.write_eof()
             except:
                 pass
-            loop.call_later(5, lambda: p.terminate())
-            loop.call_later(10, lambda: p.kill())
+            def terminate():
+                try:
+                    p.terminate()
+                except:
+                    pass
+            def kill():
+                try:
+                    p.kill()
+                except:
+                    pass
+            loop.call_later(5, terminate)
+            loop.call_later(10, kill)
 
         try:
             forked, gen = self.forkAndStream(substream)
@@ -293,11 +306,12 @@ class WyzeCamera(scrypted_sdk.ScryptedDeviceBase, VideoCamera, Settings, PanTilt
                 pkill(aprocess)
 
     async def ensureServer(self, cb) -> int:
-        server = await asyncio.start_server(cb, "127.0.0.1", 0)
+        host = os.environ.get("SCRYPTED_CLUSTER_ADDRESS", None) or "127.0.0.1"
+        server = await asyncio.start_server(cb, host, 0)
         sock = server.sockets[0]
         host, port = sock.getsockname()
         asyncio.ensure_future(server.serve_forever())
-        return port
+        return host, port
 
     async def probeCodec(self, substream: bool):
         sps: bytes = None
@@ -307,16 +321,20 @@ class WyzeCamera(scrypted_sdk.ScryptedDeviceBase, VideoCamera, Settings, PanTilt
         forked, gen = self.forkAndStream(substream)
         try:
             async for audio, data, codec, sampleRate in gen:
-                if not audio and not sps and len(data):
-                    nals = data.split(b"\x00\x00\x00\x01")
-                    sps = nals[1]
-                    pps = nals[2]
+                if not audio and (not sps or not pps) and len(data):
+                    nalus = data.split(b"\x00\x00\x00\x01")[1:]
+                    for nalu in nalus:
+                        naluType = nalu[0] & 0x1f
+                        if naluType == 7:
+                            sps = nalu
+                        elif naluType == 8:
+                            pps = nalu
 
                 if audio and not self.getMuted():
                     audioCodec = codec
                     audioSampleRate = sampleRate
 
-                if sps and (audioCodec or self.getMuted()):
+                if sps and pps and (audioCodec or self.getMuted()):
                     return (audioCodec, audioSampleRate, sps, pps)
         finally:
             forked.worker.terminate()
@@ -398,7 +416,7 @@ class WyzeCamera(scrypted_sdk.ScryptedDeviceBase, VideoCamera, Settings, PanTilt
             print_exception(self.print, e)
             raise
 
-        rfcPort = await self.rfcSubServer if substream else await self.rfcServer
+        rfcHost, rfcPort = await self.rfcSubServer if substream else await self.rfcServer
 
         msos = self.getVideoStreamOptionsInternal()
         mso = msos[1] if substream else msos[0]
@@ -425,7 +443,7 @@ b=AS:128
 a=rtpmap:97 {audioCodecName}/{info.audioSampleRate}/1
 """
         rfc = {
-            "url": f"tcp://127.0.0.1:{rfcPort}",
+            "url": f"tcp://{rfcHost}:{rfcPort}",
             "sdp": sdp,
             "mediaStreamOptions": mso,
         }
@@ -484,8 +502,8 @@ class WyzePlugin(scrypted_sdk.ScryptedDeviceBase, DeviceProvider):
         self.wyze_iotc: wyzecam.WyzeIOTC = None
         self.last_ts = 0
 
-        if sys.platform != "linux":
-            self.print("Wyze plugin must be installed under Scrypted for Linux.")
+        if sys.platform.find("linux"):
+            self.print("Wyze plugin must be installed under Scrypted for Linux. Found: " + sys.platform)
             return
 
         if platform.machine() == "x86_64":
@@ -546,7 +564,7 @@ class WyzePlugin(scrypted_sdk.ScryptedDeviceBase, DeviceProvider):
         }
 
         try:
-            resp = post_v2_device(self.authInfo, "get_event_list", params)
+            resp = post_device(self.authInfo, "get_event_list", params)
             return time.time(), resp["event_list"]
         except RateLimitError as ex:
             self.print(f"[EVENTS] RateLimitError: {ex}, cooling down.")
@@ -745,6 +763,14 @@ class WyzeFork:
 
                 asyncio.ensure_future(ptzRunner(), loop=loop)
 
+                def ignore(self, *args, **kwargs):
+                    pass
+                def ignoreTrue(self, *args, **kwargs):
+                    return True
+                sess._audio_frame_slow = ignore
+                sess._video_frame_slow = ignore
+                sess._received_first_frame = ignoreTrue
+
                 if not muted:
 
                     def runAudio():
@@ -752,6 +778,7 @@ class WyzeFork:
                         try:
                             rate = sess.get_audio_sample_rate()
                             codec: str = None
+
                             for frame, frame_info in sess.recv_audio_data():
                                 if closed:
                                     return
@@ -764,11 +791,13 @@ class WyzeFork:
                                     loop=loop,
                                 )
                         except Exception as e:
+                            # print_exception(print, e)
                             asyncio.run_coroutine_threadsafe(
                                 aq.put((True, None, None, None, format_exception(e))),
                                 loop=loop,
                             )
                         finally:
+                            # print('done audio')
                             asyncio.run_coroutine_threadsafe(
                                 aq.put((True, None, None, None, None)), loop=loop
                             )
@@ -785,18 +814,20 @@ class WyzeFork:
                     videoParm = sess.camera.camera_info.get("videoParm")
                     fps = int((videoParm and videoParm.get("fps", 20)) or 20)
 
-                    for frame in sess.recv_bridge_frame(fps=fps):
+                    for frame in sess.recv_bridge_data():
                         if closed:
                             return
                         asyncio.run_coroutine_threadsafe(
                             aq.put((False, frame, None, None, None)), loop=loop
                         )
                 except Exception as e:
+                    # print_exception(print, e)
                     asyncio.run_coroutine_threadsafe(
                         aq.put((False, None, None, None, format_exception(e))),
                         loop=loop,
                     )
                 finally:
+                    # print('done video')
                     asyncio.run_coroutine_threadsafe(
                         aq.put((False, None, None, None, None)), loop=loop
                     )

@@ -26,14 +26,18 @@ export class PluginHostAPI extends PluginAPIManagedListeners implements PluginAP
     ];
 
     restartDebounced = debounce(async () => {
+        const plugin = await this.scrypted.datastore.tryGet(Plugin, this.pluginId);
         const host = this.scrypted.plugins[this.pluginId];
+        if (!plugin) {
+            const logger = await this.getLogger(undefined);
+            logger.log('w', 'plugin restart was requested, but plugin was not found. restart cancelled.');
+            return;
+        }
         if (host?.api !== this) {
             const logger = await this.getLogger(undefined);
             logger.log('w', 'plugin restart was requested, but a different instance was found. restart cancelled.');
             return;
         }
-
-        const plugin = await this.scrypted.datastore.tryGet(Plugin, this.pluginId);
         this.scrypted.runPlugin(plugin);
     }, 15000);
 
@@ -126,7 +130,6 @@ export class PluginHostAPI extends PluginAPIManagedListeners implements PluginAP
         const device = this.scrypted.findPluginDevice(this.pluginId, nativeId)
         device.storage = storage;
         this.scrypted.datastore.upsert(device);
-        this.scrypted.stateManager.notifyInterfaceEvent(device, 'Storage', undefined);
     }
 
     async onDevicesChanged(deviceManifest: DeviceManifest) {
@@ -182,7 +185,7 @@ export class PluginHostAPI extends PluginAPIManagedListeners implements PluginAP
 
     async requestRestart() {
         const logger = await this.getLogger(undefined);
-        logger.log('i', 'plugin restart was requested');
+        logger?.log('i', 'plugin restart was requested');
         return this.restartDebounced();
     }
 

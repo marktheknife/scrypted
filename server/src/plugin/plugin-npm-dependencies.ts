@@ -4,13 +4,16 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import process from 'process';
-import semver from 'semver';
 import { ensurePluginVolume } from "./plugin-volume";
 
 export function defaultNpmExec(args: string[], options: child_process.SpawnOptions) {
     let npm = 'npm';
-    if (os.platform() === 'win32')
+    if (os.platform() === 'win32') {
         npm += '.cmd';
+        // wrap each argument in a quote to handle spaces in paths
+        // https://github.com/nodejs/node/issues/38490#issuecomment-927330248
+        args = args.map(arg => '"' + arg + '"');
+    }
     const cp = child_process.spawn(npm, args, options);
     return cp;
 }
@@ -22,8 +25,16 @@ export function setNpmExecFunction(f: typeof npmExecFunction) {
 
 export function getPluginNodePath(name: string) {
     const pluginVolume = ensurePluginVolume(name);
-    const nodeMajorVersion = semver.parse(process.version).major;
-    let nodeVersionedDirectory = `node${nodeMajorVersion}-${process.platform}-${process.arch}`;
+
+    const abi = process.versions.modules;
+    let runtime = process.env.npm_config_runtime;
+    if (!runtime && process.versions.electron)
+        runtime = 'electron';
+    if (!runtime)
+        runtime = 'node';
+    const { platform, arch } = process;
+    let nodeVersionedDirectory = `n-${runtime}-v${abi}-${platform}-${arch}`;
+
     const scryptedBase = process.env.SCRYPTED_BASE_VERSION;
     if (scryptedBase)
         nodeVersionedDirectory += '-' + scryptedBase;
@@ -72,6 +83,8 @@ export async function installOptionalDependencies(console: Console, packageJson:
         const cp = npmExecFunction(['--prefix', nodePrefix, 'install'], {
             cwd: nodePrefix,
             stdio: 'inherit',
+            // allow spawning .cmd https://nodejs.org/en/blog/vulnerability/april-2024-security-releases-2
+            shell: os.platform() === 'win32' ? true : undefined,
         });
 
         await once(cp, 'exit');
@@ -92,7 +105,7 @@ export async function installOptionalDependencies(console: Console, packageJson:
             if (!de.isDirectory())
                 return;
             if (de.name.startsWith('linux') || de.name.startsWith('darwin') || de.name.startsWith('win32')
-                || de.name.startsWith('python') || de.name.startsWith('node')) {
+                || de.name.startsWith('python') || de.name.startsWith('node') || de.name.startsWith('n-')) {
                 console.log('Removing old dependencies:', filePath);
                 try {
                     await fs.promises.rm(filePath, {

@@ -1,6 +1,6 @@
 {
    "name": "@scrypted/prebuffer-mixin",
-   "version": "0.10.12",
+   "version": "0.10.45",
    "description": "Video Stream Rebroadcast, Prebuffer, and Management Plugin for Scrypted.",
    "author": "Scrypted",
    "license": "Apache-2.0",
@@ -26,7 +26,7 @@
       "name": "Rebroadcast Plugin",
       "type": "API",
       "interfaces": [
-         "DeviceProvider",
+         "Settings",
          "MixinProvider",
          "BufferConverter"
       ],

@@ -103,7 +103,10 @@ class SnapshotMixin extends SettingsMixinDeviceBase<Camera> implements Camera {
             type: 'clippath',
         },
     });
-    snapshotDebouncer = createMapPromiseDebouncer<Buffer>();
+    snapshotDebouncer = createMapPromiseDebouncer<{
+        picture: Buffer;
+        pictureTime: number;
+    }>();
     errorPicture: RefreshPromise<Buffer>;
     timeoutPicture: RefreshPromise<Buffer>;
     progressPicture: RefreshPromise<Buffer>;
@@ -192,8 +195,10 @@ class SnapshotMixin extends SettingsMixinDeviceBase<Camera> implements Camera {
 
         if (usePrebufferSnapshots) {
             const takePicture = await preparePrebufferSnapshot()
-            if (!takePicture)
+            if (!takePicture) {
+                this.debugConsole?.warn('Prebuffer snapshot was requested but prebuffer is unavailable.');
                 throw new PrebufferUnavailableError();
+            }
             return takePicture();
         }
 
@@ -203,6 +208,7 @@ class SnapshotMixin extends SettingsMixinDeviceBase<Camera> implements Camera {
             const takePicture = await preparePrebufferSnapshot()
             if (!takePicture)
                 throw e;
+            this.console.error('Snapshot failed, falling back to prebuffer', e);
             return takePicture();
         }
 
@@ -267,122 +273,148 @@ class SnapshotMixin extends SettingsMixinDeviceBase<Camera> implements Camera {
     }
 
     async takePictureRaw(options?: RequestPictureOptions): Promise<Buffer> {
-        let picture: Buffer;
         const eventSnapshot = options?.reason === 'event';
         const periodicSnapshot = options?.reason === 'periodic';
 
+        // clear out snapshots that are too old.
+        if (this.currentPictureTime < Date.now() - 1 * 60 * 60 * 1000)
+            this.currentPicture = undefined;
+
+        // always grab/debounce a snapshot
+        // event snapshot are special and should immediately expire.
+        // other snapshots may be debounced for 4s.
+        const debounced = this.snapshotDebouncer({
+            id: options?.id,
+            type: 'source',
+            event: options?.reason === 'event',
+        }, eventSnapshot ? 0 : 4000, async () => {
+            const snapshotTimer = Date.now();
+            let picture = await this.takePictureInternal();
+            picture = await this.cropAndScale(picture);
+            this.clearCachedPictures();
+            const pictureTime = Date.now();
+            this.currentPicture = picture;
+            this.currentPictureTime = pictureTime;
+            this.lastAvailablePicture = picture;
+            this.debugConsole?.debug(`Periodic snapshot took ${(this.currentPictureTime - snapshotTimer) / 1000} seconds to retrieve.`)
+            return {
+                picture,
+                pictureTime,
+            };
+        });
+        debounced.catch(() => { });
+
+        // prevent this from expiring
+        let availablePicture = this.currentPicture;
+        let availablePictureTime = this.currentPictureTime;
+
+        let rawPicture: Awaited<typeof debounced>;
         try {
-            const debounced = this.snapshotDebouncer({
-                id: options?.id,
-                reason: options?.reason,
-            }, eventSnapshot ? 0 : 2000, async () => {
-                const snapshotTimer = Date.now();
-                let picture = await this.takePictureInternal();
-                picture = await this.cropAndScale(picture);
-                this.clearCachedPictures();
-                this.currentPicture = picture;
-                this.currentPictureTime = Date.now();
-                this.lastAvailablePicture = picture;
-                this.debugConsole?.debug(`Periodic snapshot took ${(this.currentPictureTime - snapshotTimer) / 1000} seconds to retrieve.`)
-                return picture;
-            });
-
-            // periodic snapshot should get the immediately available picture.
-            // the debounce has already triggered a refresh for the next go around.
-            if (periodicSnapshot && this.currentPicture) {
-                const cp = this.currentPicture;
-                debounced.catch(() => {});
-                try {
-                    picture = await (options.timeout ? timeoutPromise(options.timeout, debounced) : debounced);
+            let pictureTimeout = options?.timeout;
+            if (!pictureTimeout) {
+                // determine a fetch timeout based on the reason and staleness
+                const allowedSnapshotStaleness = eventSnapshot ? 0 : periodicSnapshot ? 20000 : 10000;
+                if (!availablePicture) {
+                    // none available so wait a while
+                    pictureTimeout = 10000;
                 }
-                catch (e) {
-                    if (options.timeout)
-                        this.debugConsole?.log(`Periodic snapshot took longer than ${options.timeout} seconds to retrieve, falling back to cached picture.`)
-
-                    picture = cp;
+                else {
+                    if (availablePictureTime > Date.now() - 3000) {
+                        // very recent, don't wait for too long
+                        pictureTimeout = 1000;
+                    }
+                    else if (availablePictureTime > Date.now() - allowedSnapshotStaleness) {
+                        // fairly recent so give it little time to get a fresh one
+                        // idr interval is typically 4000 for reference
+                        pictureTimeout = 3000;
+                    }
+                    else {
+                        // stale so wait a while
+                        pictureTimeout = 10000;
+                    }
                 }
             }
-            else {
-                picture = await debounced;
-            }
+            rawPicture = await timeoutPromise(pictureTimeout, debounced);
         }
         catch (e) {
-            // use the fallback cached picture if it is somewhat recent.
-            if (this.currentPictureTime < Date.now() - 1 * 60 * 60 * 1000)
-                this.currentPicture = undefined;
+            // a best effort was made to get a recent snapshot from cache or from a camera request,
+            // the cache request will never fail, but if the camera request fails,
+            // it may be ok to use a somewhat stale snapshot depending on reason.
+
             // event snapshot requests must not use cache since they're for realtime processing by homekit and nvr.
             if (eventSnapshot)
                 throw e;
 
-            if (!this.currentPicture)
+            if (this.currentPicture) {
+                // use the current picture if it is still available as it may be newer.
+                availablePicture = this.currentPicture;
+                availablePictureTime = this.currentPictureTime;
+            }
+
+            if (!availablePicture)
                 return this.createErrorImage(e);
 
             this.console.warn('Snapshot failed, but recovered from cache', e);
-            picture = this.currentPicture;
+            rawPicture = {
+                picture: availablePicture,
+                pictureTime: availablePictureTime,
+            };
+
+            // gc
+            availablePicture = undefined;
         }
 
         const needSoftwareResize = !!(options?.picture?.width || options?.picture?.height) && this.storageSettings.values.snapshotResolution !== 'Full Resolution';
-        if (needSoftwareResize) {
-            try {
-                picture = await this.snapshotDebouncer({
-                    needSoftwareResize: true,
-                    picture: options.picture,
-                }, eventSnapshot ? 0 : 2000, async () => {
-                    this.debugConsole?.log("Resizing picture from camera", options?.picture);
 
-                    if (loadSharp()) {
-                        const vips = await loadVipsImage(picture, this.id);
-                        try {
-                            const ret = await vips.toBuffer({
-                                resize: options?.picture,
-                                format: 'jpg',
-                            });
-                            return ret;
-                        }
-                        finally {
-                            vips.close();
-                        }
+        if (!needSoftwareResize)
+            return rawPicture.picture;
+
+        try {
+            const key = {
+                type: 'resize',
+                pictureTime: rawPicture.pictureTime,
+                needSoftwareResize: true,
+                picture: options.picture,
+            };
+            const ret = await this.snapshotDebouncer(key, 10000, async () => {
+                this.debugConsole?.log("Resizing picture from camera", key);
+
+                if (loadSharp()) {
+                    const vips = await loadVipsImage(rawPicture.picture, this.id);
+                    try {
+                        const ret = await vips.toBuffer({
+                            resize: options?.picture,
+                            format: 'jpg',
+                        });
+                        return {
+                            picture: ret,
+                            pictureTime: rawPicture.pictureTime,
+                        };
                     }
+                    finally {
+                        vips.close();
+                    }
+                }
 
-                    // try {
-                    //     const mo = await mediaManager.createMediaObject(picture, 'image/jpeg', {
-                    //         sourceId: this.id,
-                    //     });
-                    //     const image = await mediaManager.convertMediaObject<Image>(mo, ScryptedMimeTypes.Image);
-                    //     let { width, height } = options.picture;
-                    //     if (!width)
-                    //         width = height / image.height * image.width;
-                    //     if (!height)
-                    //         height = width / image.width * image.height;
-                    //     return await image.toBuffer({
-                    //         resize: {
-                    //             width,
-                    //             height,
-                    //         },
-                    //         format: 'jpg',
-                    //     });
-                    // }
-                    // catch (e) {
-                    //     if (!e.message?.includes('no converter found'))
-                    //         throw e;
-                    // }
-
-                    return ffmpegFilterImageBuffer(picture, {
-                        console: this.debugConsole,
-                        ffmpegPath: await mediaManager.getFFmpegPath(),
-                        resize: options?.picture,
-                        timeout: 10000,
-                    });
-
+                const ret = await ffmpegFilterImageBuffer(rawPicture.picture, {
+                    console: this.debugConsole,
+                    ffmpegPath: await mediaManager.getFFmpegPath(),
+                    resize: options?.picture,
+                    timeout: 10000,
                 });
-            }
-            catch (e) {
-                if (eventSnapshot)
-                    throw e;
-                return this.createErrorImage(e);
-            }
+                return {
+                    picture: ret,
+                    pictureTime: rawPicture.pictureTime,
+                };
+            });
+
+            return ret.picture;
         }
-        return picture;
+        catch (e) {
+            if (eventSnapshot)
+                throw e;
+            return this.createErrorImage(e);
+        }
     }
 
     async takePicture(options?: RequestPictureOptions): Promise<MediaObject> {
@@ -504,6 +536,7 @@ class SnapshotMixin extends SettingsMixinDeviceBase<Camera> implements Camera {
             return this.progressPicture.promise;
         }
         else {
+            this.console.error('Snapshot failed', e);
             this.errorPicture = singletonPromise(this.errorPicture,
                 () => this.createTextErrorImage('Snapshot Failed'));
             return this.errorPicture.promise;
@@ -571,6 +604,7 @@ export class SnapshotPlugin extends AutoenableMixinProvider implements MixinProv
         },
     });
     mixinDevices = new Map<string, SnapshotMixin>();
+    authenticatedPath = sdk.endpointManager.getAuthenticatedPath(this.nativeId)
 
     constructor(nativeId?: string) {
         super(nativeId);
@@ -642,9 +676,8 @@ export class SnapshotPlugin extends AutoenableMixinProvider implements MixinProv
             return this.console;
     }
 
-
     async getLocalSnapshot(id: string, iface: string, search: string) {
-        const endpoint = await sdk.endpointManager.getAuthenticatedPath(this.nativeId);
+        const endpoint = await this.authenticatedPath;
         const ret = url.resolve(path.join(endpoint, id, iface, `${Date.now()}.jpg`) + `${search}`, '');
         return Buffer.from(ret);
     }
@@ -682,15 +715,20 @@ export class SnapshotPlugin extends AutoenableMixinProvider implements MixinProv
             const search = new URLSearchParams(pathname.split('?')[1]);
             const mixin = this.mixinDevices.get(id);
             let buffer: Buffer;
+            let timeout = parseInt(search.get('timeout'));
+            // make web requests timeout after 5 seconds by default.
+            if (isNaN(timeout))
+                timeout = 5000;
             const rpo: RequestPictureOptions = {
                 reason: search.get('reason') as 'event' | 'periodic',
+                timeout,
                 picture: {
                     width: parseInt(search.get('width')) || undefined,
                     height: parseInt(search.get('height')) || undefined,
                 }
             };
 
-            if (mixin.storageSettings.values.snapshotResolution === 'Full Resolution')
+            if (mixin?.storageSettings.values.snapshotResolution === 'Full Resolution')
                 delete rpo.picture;
 
             if (mixin && iface === ScryptedInterface.Camera) {
@@ -710,6 +748,7 @@ export class SnapshotPlugin extends AutoenableMixinProvider implements MixinProv
             });
         }
         catch (e) {
+            this.debugConsole?.error('snapshot http request failed', e);
             response.send('', {
                 code: 500,
             });

@@ -69,27 +69,21 @@ The recommended codec settings for cameras in HomeKit can be viewed in the [Home
 
 The latest troubleshooting guide for all known streaming or recording issues can be viewed in the [HomeKit plugin](#/device/${id}).`;
 
+        if (this.storageSettings.values.standalone) {
+            readme += `
+
+## HomeKit Pairing
+
+${this.storageSettings.values.pincode}
+${this.storageSettings.values.qrCode}
+            `
+        }
+
         return readme;
     }
 
     async getMixinSettings(): Promise<Setting[]> {
         const settings: Setting[] = [];
-        const realDevice = systemManager.getDeviceById<ObjectDetector & VideoCamera>(this.id);
-
-        if (this.storage.getItem('linkedMotionSensor')) {
-            settings.push(
-                {
-                    title: 'Linked Motion Sensor',
-                    key: 'linkedMotionSensor',
-                    type: 'device',
-                    deviceFilter: 'interfaces.includes("MotionSensor")',
-                    value: this.storage.getItem('linkedMotionSensor') || this.id,
-                    placeholder: this.interfaces.includes(ScryptedInterface.MotionSensor)
-                        ? undefined : 'None',
-                    description: "Set the motion sensor used to trigger HomeKit Secure Video recordings. Defaults to the device provided motion sensor when available.",
-                },
-            );
-        }
 
         // settings.push({
         //     title: 'H265 Streams',
@@ -101,6 +95,7 @@ The latest troubleshooting guide for all known streaming or recording issues can
 
         settings.push({
             title: 'RTP Sender',
+            subgroup: 'Debug',
             key: 'rtpSender',
             description: 'The RTP Sender used by Scrypted. FFMpeg is stable. Scrypted is experimental and much faster.',
             choices: [
@@ -115,6 +110,7 @@ The latest troubleshooting guide for all known streaming or recording issues can
 
         settings.push({
             title: 'Debug Mode',
+            subgroup: 'Debug',
             key: 'debugMode',
             description: 'Force transcoding on this camera for streaming and recording. This setting can be used to diagnose errors with HomeKit functionality. Enable the Rebroadcast plugin for more robust transcoding options.',
             choices: [
@@ -126,16 +122,6 @@ The latest troubleshooting guide for all known streaming or recording issues can
             value: debugMode.value,
         });
 
-        if (this.interfaces.includes(ScryptedInterface.AudioSensor)) {
-            settings.push({
-                title: 'Audio Activity Detection',
-                key: 'detectAudio',
-                type: 'boolean',
-                value: (this.storage.getItem('detectAudio') === 'true').toString(),
-                description: 'Trigger HomeKit Secure Video recording on audio activity.',
-            });
-        }
-
         if (this.interfaces.includes(ScryptedInterface.OnOff)) {
             settings.push({
                 title: 'Camera Status Indicator',
@@ -146,7 +132,7 @@ The latest troubleshooting guide for all known streaming or recording issues can
             });
         }
 
-        return [...settings, ...await this.cameraStorageSettings.getSettings(), ...await super.getMixinSettings()];
+        return [...await super.getMixinSettings(), ...settings, ...await this.cameraStorageSettings.getSettings()];
     }
 
     async putMixinSetting(key: string, value: SettingValue) {
@@ -159,10 +145,6 @@ The latest troubleshooting guide for all known streaming or recording issues can
         }
         else {
             this.storage.setItem(key, value?.toString() || '');
-        }
-
-        if (key === 'detectAudio' || key === 'linkedMotionSensor') {
-            super.alertReload();
         }
 
         deviceManager.onMixinEvent(this.id, this, ScryptedInterface.Settings, undefined);

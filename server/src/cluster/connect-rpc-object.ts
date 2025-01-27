@@ -1,8 +1,27 @@
 export interface ClusterObject {
+    /**
+     * Id of the cluster.
+     */
     id: string;
+    /**
+     * Address of the process that created this object.
+     */
+    address: string;
+    /**
+     * Port of the process that created this object.
+     */
     port: number;
+    /**
+     * Id of the object within the source peer.
+     */
     proxyId: string;
-    sourcePort: number;
+    /**
+     * Id of the source peer.
+     */
+    sourceKey: string;
+    /**
+     * Hash of the object.
+     */
     sha256: string;
 }
 

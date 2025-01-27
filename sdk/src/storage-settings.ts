@@ -1,4 +1,4 @@
-import sdk, { ScryptedInterface, Setting, Settings, SettingValue } from ".";
+import sdk, { ScryptedDeviceType, ScryptedInterface, Setting, Settings, SettingValue } from ".";
 
 const { systemManager } = sdk;
 
@@ -17,10 +17,16 @@ function parseValue(value: string | null | undefined, setting: StorageSetting, r
         return readDefaultValue() || false;
     }
     if (type === 'number') {
-        return parseFloat(value) || readDefaultValue() || 0;
+        const n = parseFloat(value);
+        if (!isNaN(n))
+            return n;
+        return readDefaultValue() || 0;
     }
     if (type === 'integer') {
-        return parseInt(value) || readDefaultValue() || 0;
+        const n = parseInt(value);
+        if (!isNaN(n))
+            return n;
+        return readDefaultValue() || 0;
     }
     if (type === 'array') {
         if (!value)
@@ -51,9 +57,9 @@ function parseValue(value: string | null | undefined, setting: StorageSetting, r
     return value || readDefaultValue();
 }
 
-export type HideFunction = (device: any) => boolean;
+export interface StorageSetting extends Omit<Setting, 'deviceFilter'> {
+    deviceFilter?: string | ((test: { id: string, deviceInterface: string, interfaces: string[], type: ScryptedDeviceType, ScryptedDeviceType: typeof ScryptedDeviceType, ScryptedInterface: typeof ScryptedInterface }) => boolean);
 
-export interface StorageSetting extends Setting {
     defaultValue?: any;
     persistedDefaultValue?: any;
     onPut?: (oldValue: any, newValue: any) => void;
@@ -134,7 +140,9 @@ export class StorageSettings<T extends string> implements Settings {
                 continue;
             s.key = key;
             s.value = this.getItemInternal(key as T, s, true);
-            ret.push(s);
+            if (typeof s.deviceFilter === 'function')
+                s.deviceFilter = s.deviceFilter.toString();
+            ret.push(s as Setting);
             delete s.onPut;
             delete s.onGet;
             delete s.mapPut;
@@ -164,14 +172,15 @@ export class StorageSettings<T extends string> implements Settings {
                 this.device.storage.setItem(key, value?.toString());
         }
         setting?.onPut?.(oldValue, value);
-        this.device.onDeviceEvent(ScryptedInterface.Settings, undefined);
+        if (!setting?.hide)
+            this.device.onDeviceEvent(ScryptedInterface.Settings, undefined);
     }
 
     getItemInternal(key: T, setting: StorageSetting, rawDevice?: boolean): any {
         if (!setting)
             return this.device.storage.getItem(key);
         const readDefaultValue = () => {
-            if (setting.persistedDefaultValue) {
+            if (setting.persistedDefaultValue != null) {
                 this.putSettingInternal(setting, undefined, key, setting.persistedDefaultValue);
                 return setting.persistedDefaultValue;
             }

@@ -1,12 +1,10 @@
-import { AuthFetchCredentialState, AuthFetchOptions, authHttpFetch } from '@scrypted/common/src/http-auth-fetch';
-import { EventEmitter } from 'events';
-import https, { RequestOptions } from 'https';
+import { AuthFetchCredentialState, authHttpFetch } from '@scrypted/common/src/http-auth-fetch';
 import { PassThrough, Readable } from 'stream';
-import { HttpFetchOptions, HttpFetchResponseType } from '../../../server/src/fetch/http-fetch';
+import { HttpFetchOptions } from '../../../server/src/fetch/http-fetch';
 
-import { getMotionState, reolinkHttpsAgent } from './probe';
-import { PanTiltZoomCommand } from "@scrypted/sdk";
 import { sleep } from "@scrypted/common/src/sleep";
+import { PanTiltZoomCommand } from "@scrypted/sdk";
+import { DevInfo, getLoginParameters } from './probe';
 
 export interface Enc {
     audio: number;
@@ -26,28 +24,6 @@ export interface Stream {
     width: number;
 }
 
-export interface DevInfo {
-    B485: number;
-    IOInputNum: number;
-    IOOutputNum: number;
-    audioNum: number;
-    buildDay: string;
-    cfgVer: string;
-    channelNum: number;
-    detail: string;
-    diskNum: number;
-    exactType: string;
-    firmVer: string;
-    frameworkVer: number;
-    hardVer: string;
-    model: string;
-    name: string;
-    pakSuffix: string;
-    serial: string;
-    type: string;
-    wifi: number;
-}
-
 export interface AIDetectionState {
     alarm_state: number;
     support: number;
@@ -59,21 +35,30 @@ export type AIState = {
     channel: number;
 };
 
+export type SirenResponse = {
+    rspCode: number;
+}
+
+export interface PtzPreset {
+    id: number;
+    name: string;
+}
+
 export class ReolinkCameraClient {
     credential: AuthFetchCredentialState;
+    parameters: Record<string, string>;
+    tokenLease: number;
 
-    constructor(public host: string, public username: string, public password: string, public channelId: number, public console: Console) {
+    constructor(public host: string, public username: string, public password: string, public channelId: number, public console: Console, public readonly forceToken?: boolean) {
         this.credential = {
             username,
             password,
         };
     }
 
-    async request(urlOrOptions: string | URL | HttpFetchOptions<Readable>, body?: Readable) {
+    private async request(options: HttpFetchOptions<Readable>, body?: Readable) {
         const response = await authHttpFetch({
-            ...typeof urlOrOptions !== 'string' && !(urlOrOptions instanceof URL) ? urlOrOptions : {
-                url: urlOrOptions,
-            },
+            ...options,
             rejectUnauthorized: false,
             credential: this.credential,
             body,
@@ -81,14 +66,41 @@ export class ReolinkCameraClient {
         return response;
     }
 
+    private createReadable = (data: any) => {
+        const pt = new PassThrough();
+        pt.write(Buffer.from(JSON.stringify(data)));
+        pt.end();
+        return pt;
+    }
+
+    async login() {
+        if (this.tokenLease > Date.now()) {
+            return;
+        }
+
+        this.console.log(`token expired at ${this.tokenLease}, renewing...`);
+
+        const { parameters, leaseTimeSeconds } = await getLoginParameters(this.host, this.username, this.password, this.forceToken);
+        this.parameters = parameters
+        this.tokenLease = Date.now() + 1000 * leaseTimeSeconds;
+    }
+
+    async requestWithLogin(options: HttpFetchOptions<Readable>, body?: Readable) {
+        await this.login();
+        const url = options.url as URL;
+        const params = url.searchParams;
+        for (const [k, v] of Object.entries(this.parameters)) {
+            params.set(k, v);
+        }
+        return this.request(options, body);
+    }
+
     async reboot() {
         const url = new URL(`http://${this.host}/api.cgi`);
         const params = url.searchParams;
         params.set('cmd', 'Reboot');
-        params.set('user', this.username);
-        params.set('password', this.password);
-        const response = await this.request({
-            url: url.toString(),
+        const response = await this.requestWithLogin({
+            url,
             responseType: 'json',
         });
         return {
@@ -107,7 +119,18 @@ export class ReolinkCameraClient {
     //     }
     //  ]
     async getMotionState() {
-        return getMotionState(this.credential, this.username, this.password, this.host, this.channelId);
+        const url = new URL(`http://${this.host}/api.cgi`);
+        const params = url.searchParams;
+        params.set('cmd', 'GetMdState');
+        params.set('channel', this.channelId.toString());
+        const response = await this.requestWithLogin({
+            url,
+            responseType: 'json',
+        });
+        return {
+            value: !!response.body?.[0]?.value?.state,
+            data: response.body,
+        };
     }
 
     async getAiState() {
@@ -115,30 +138,68 @@ export class ReolinkCameraClient {
         const params = url.searchParams;
         params.set('cmd', 'GetAiState');
         params.set('channel', this.channelId.toString());
-        params.set('user', this.username);
-        params.set('password', this.password);
-        const response = await this.request({
+        const response = await this.requestWithLogin({
             url,
             responseType: 'json',
         });
         return {
-            value: response.body?.[0]?.value as AIState,
+            value: (response.body?.[0]?.value || response.body?.value) as AIState,
             data: response.body,
         };
     }
 
-    async jpegSnapshot() {
+    async getAbility() {
+        const url = new URL(`http://${this.host}/api.cgi`);
+        const params = url.searchParams;
+        params.set('cmd', 'GetAbility');
+        params.set('channel', this.channelId.toString());
+        let response = await this.requestWithLogin({
+            url,
+            responseType: 'json',
+        });
+        let error = response.body?.[0]?.error;
+        if (error) {
+            this.console.error('error during call to getAbility GET, Trying with POST', error);
+
+            url.search = '';
+
+            const body = [
+                {
+                    cmd: "GetAbility",
+                    action: 0,
+                    param: { User: { userName: this.username } }
+                }
+            ];
+
+            response = await this.requestWithLogin({
+                url,
+                responseType: 'json',
+                method: 'POST',
+            }, this.createReadable(body));
+
+            error = response.body?.[0]?.error;
+            if (error) {
+                this.console.error('error during call to getAbility GET, Trying with POST', error);
+                throw new Error('error during call to getAbility');
+            }
+        }
+
+        return {
+            value: response.body?.[0]?.value || response.body?.value,
+            data: response.body,
+        };
+    }
+
+    async jpegSnapshot(timeout = 10000) {
         const url = new URL(`http://${this.host}/cgi-bin/api.cgi`);
         const params = url.searchParams;
         params.set('cmd', 'Snap');
         params.set('channel', this.channelId.toString());
         params.set('rs', Date.now().toString());
-        params.set('user', this.username);
-        params.set('password', this.password);
 
-        const response = await this.request({
+        const response = await this.requestWithLogin({
             url,
-            timeout: 60000,
+            timeout,
         });
 
         return response.body;
@@ -150,9 +211,7 @@ export class ReolinkCameraClient {
         params.set('cmd', 'GetEnc');
         // is channel used on this call?
         params.set('channel', this.channelId.toString());
-        params.set('user', this.username);
-        params.set('password', this.password);
-        const response = await this.request({
+        const response = await this.requestWithLogin({
             url,
             responseType: 'json',
         });
@@ -164,65 +223,106 @@ export class ReolinkCameraClient {
         const url = new URL(`http://${this.host}/api.cgi`);
         const params = url.searchParams;
         params.set('cmd', 'GetDevInfo');
-        params.set('user', this.username);
-        params.set('password', this.password);
-        const response = await this.request({
+        const response = await this.requestWithLogin({
             url,
             responseType: 'json',
         });
+        const error = response.body?.[0]?.error;
+        if (error) {
+            this.console.error('error during call to getDeviceInfo', error);
+            throw new Error('error during call to getDeviceInfo');
+        }
 
-        return response.body?.[0]?.value?.DevInfo;
+        const deviceInfo: DevInfo = await response.body?.[0]?.value?.DevInfo;
+
+        // Will need to check if it's valid for NVR and NVR_WIFI
+        if (!['HOMEHUB', 'NVR', 'NVR_WIFI'].includes(deviceInfo.exactType)) {
+            return deviceInfo;
+        }
+
+        // If the device is listed as homehub, fetch the channel specific information
+        url.search = '';
+        const body = [
+            { cmd: "GetChnTypeInfo", action: 0, param: { channel: this.channelId } },
+            { cmd: "GetChannelstatus", action: 0, param: {} },
+        ]
+
+        const additionalInfoResponse = await this.requestWithLogin({
+            url,
+            method: 'POST',
+            responseType: 'json'
+        }, this.createReadable(body));
+
+        const chnTypeInfo = additionalInfoResponse?.body?.find(elem => elem.cmd === 'GetChnTypeInfo');
+        const chnStatus = additionalInfoResponse?.body?.find(elem => elem.cmd === 'GetChannelstatus');
+
+        if (chnTypeInfo?.value) {
+            deviceInfo.firmVer = chnTypeInfo.value.firmVer;
+            deviceInfo.model = chnTypeInfo.value.typeInfo;
+            deviceInfo.pakSuffix = chnTypeInfo.value.pakSuffix;
+        }
+
+        if (chnStatus?.value) {
+            const specificChannelStatus = chnStatus.value?.status?.find(elem => elem.channel === this.channelId);
+
+            if (specificChannelStatus) {
+                deviceInfo.name = specificChannelStatus.name;
+            }
+        }
+
+
+        return deviceInfo;
     }
 
-    async ptz(command: PanTiltZoomCommand) {
-        let op = '';
-        if (command.pan < 0)
-            op += 'Left';
-        else if (command.pan > 0)
-            op += 'Right'
-        if (command.tilt < 0)
-            op += 'Down';
-        else if (command.tilt > 0)
-            op += 'Up';
+    async getPtzPresets(): Promise<PtzPreset[]> {
+        const url = new URL(`http://${this.host}/api.cgi`);
+        const params = url.searchParams;
+        params.set('cmd', 'GetPtzPreset');
+        const body = [
+            {
+                cmd: "GetPtzPreset",
+                action: 1,
+                param: {
+                    channel: this.channelId
+                }
+            }
+        ];
+        const response = await this.requestWithLogin({
+            url,
+            responseType: 'json',
+            method: 'POST'
+        }, this.createReadable(body));
+        return response.body?.[0]?.value?.PtzPreset?.filter(preset => preset.enable === 1);
+    }
 
-        if (!op)
-            return;
-
+    private async ptzOp(op: string, speed: number, id?: number) {
         const url = new URL(`http://${this.host}/api.cgi`);
         const params = url.searchParams;
         params.set('cmd', 'PtzCtrl');
-        params.set('user', this.username);
-        params.set('password', this.password);
 
-        const createReadable = (data: any) => {
-            const pt = new PassThrough();
-            pt.write(Buffer.from(JSON.stringify(data)));
-            pt.end();
-            return pt;
-        }
-
-        const c1 = this.request({
+        const c1 = this.requestWithLogin({
             url,
             method: 'POST',
             responseType: 'text',
-        }, createReadable([
+        }, this.createReadable([
             {
                 cmd: "PtzCtrl",
                 param: {
                     channel: this.channelId,
                     op,
-                    speed: 10,
+                    speed,
                     timeout: 1,
+                    id
                 }
             },
         ]));
 
         await sleep(500);
 
-        const c2 = this.request({
+        const c2 = this.requestWithLogin({
             url,
             method: 'POST',
-        }, createReadable([
+        }, this.createReadable([
             {
                 cmd: "PtzCtrl",
                 param: {
@@ -234,5 +334,165 @@ export class ReolinkCameraClient {
 
         this.console.log(await c1);
         this.console.log(await c2);
+    }
+
+    private async presetOp(speed: number, id: number) {
+        const url = new URL(`http://${this.host}/api.cgi`);
+        const params = url.searchParams;
+        params.set('cmd', 'PtzCtrl');
+
+        const c1 = this.requestWithLogin({
+            url,
+            method: 'POST',
+            responseType: 'text',
+        }, this.createReadable([
+            {
+                cmd: "PtzCtrl",
+                param: {
+                    channel: this.channelId,
+                    op: 'ToPos',
+                    speed,
+                    id
+                }
+            },
+        ]));
+    }
+
+    async ptz(command: PanTiltZoomCommand) {
+        // reolink doesnt accept signed values to ptz
+        // in favor of explicit direction.
+        // so we need to convert the signed values to abs explicit direction.
+        if (command.preset && !Number.isNaN(Number(command.preset))) {
+            await this.presetOp(1, Number(command.preset));
+            return;
+        }
+
+        let op = '';
+        if (command.pan < 0)
+            op += 'Left';
+        else if (command.pan > 0)
+            op += 'Right'
+        if (command.tilt < 0)
+            op += 'Down';
+        else if (command.tilt > 0)
+            op += 'Up';
+
+        if (op) {
+            await this.ptzOp(op, Math.ceil(Math.abs(command?.pan || command?.tilt || 1) * 10));
+        }
+
+        op = undefined;
+        if (command.zoom < 0)
+            op = 'ZoomDec';
+        else if (command.zoom > 0)
+            op = 'ZoomInc';
+
+        if (op) {
+            await this.ptzOp(op, Math.ceil(Math.abs(command?.zoom || 1) * 10));
+        }
+    }
+
+    async setSiren(on: boolean, duration?: number) {
+        const url = new URL(`http://${this.host}/api.cgi`);
+        const params = url.searchParams;
+        params.set('cmd', 'AudioAlarmPlay');
+
+        let alarmMode;
+        if (duration) {
+            alarmMode = {
+                alarm_mode: 'times',
+                times: duration
+            };
+        }
+        else {
+            alarmMode = {
+                alarm_mode: 'manul',
+                manual_switch: on ? 1 : 0
+            };
+        }
+
+        const response = await this.requestWithLogin({
+            url,
+            method: 'POST',
+            responseType: 'json',
+        }, this.createReadable([
+            {
+                cmd: "AudioAlarmPlay",
+                action: 0,
+                param: {
+                    channel: this.channelId,
+                    ...alarmMode
+                }
+            },
+        ]));
+        return {
+            value: (response.body?.[0]?.value || response.body?.value) as SirenResponse,
+            data: response.body,
+        };
+    }
+
+    async setWhiteLedState(on?: boolean, brightness?: number) {
+        const url = new URL(`http://${this.host}/api.cgi`);
+
+        const settings: any = { channel: this.channelId };
+
+        if (on !== undefined) {
+            settings.state = on ? 1 : 0;
+        }
+
+        if (brightness !== undefined) {
+            settings.bright = brightness;
+        }
+
+        const body = [{
+            cmd: 'SetWhiteLed',
+            param: { WhiteLed: settings }
+        }];
+
+        const response = await this.requestWithLogin({
+            url,
+            method: 'POST',
+            responseType: 'json',
+        }, this.createReadable(body));
+
+        const error = response.body?.[0]?.error;
+        if (error) {
+            this.console.error('error during call to setWhiteLedState', JSON.stringify(body), error);
+        }
+    }
+
+    async getBatteryInfo() {
+        const url = new URL(`http://${this.host}/api.cgi`);
+
+        const body = [
+            {
+                cmd: "GetBatteryInfo",
+                action: 0,
+                param: { channel: this.channelId }
+            },
+            {
+                cmd: "GetChannelstatus",
+            }
+        ];
+
+        const response = await this.requestWithLogin({
+            url,
+            responseType: 'json',
+            method: 'POST',
+        }, this.createReadable(body));
+
+        const error = response.body?.find(elem => elem.error)?.error;
+        if (error) {
+            this.console.error('error during call to getBatteryInfo', error);
+        }
+
+        const batteryInfoEntry = response.body.find(entry => entry.cmd === 'GetBatteryInfo')?.value?.Battery;
+        const channelStatusEntry = response.body.find(entry => entry.cmd === 'GetChannelstatus')?.value?.status
+            ?.find(chStatus => chStatus.channel === this.channelId)
+
+        return {
+            batteryPercent: batteryInfoEntry?.batteryPercent,
+            sleep: channelStatusEntry?.sleep === 1,
+        }
     }
 }

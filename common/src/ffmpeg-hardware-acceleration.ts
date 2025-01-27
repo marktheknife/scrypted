@@ -19,7 +19,7 @@ function isPi(model: string) {
 export function isRaspberryPi() {
     let cpuInfo: string;
     try {
-        cpuInfo = require('realfs').readFileSync('/proc/cpuinfo', { encoding: 'utf8' });
+        cpuInfo = require('fs').readFileSync('/proc/cpuinfo', { encoding: 'utf8' });
     }
     catch (e) {
         // if this fails, this is probably not a pi
@@ -70,11 +70,7 @@ export function getH264DecoderArgs(): CodecArgs {
         ],
     };
 
-    if (isRaspberryPi()) {
-        ret['Raspberry Pi'] = ['-c:v', 'h264_mmal'];
-        ret[V4L2] = ['-c:v', 'h264_v4l2m2m'];
-    }
-    else if (os.platform() === 'linux') {
+    if (os.platform() === 'linux') {
         ret[V4L2] = ['-c:v', 'h264_v4l2m2m'];
     }
     else if (os.platform() === 'win32') {

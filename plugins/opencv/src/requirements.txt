@@ -1,9 +1,3 @@
-# plugin
-numpy>=1.16.2
-# pillow for anything not intel linux
-Pillow>=5.4.1; sys_platform != 'linux' or platform_machine != 'x86_64'
-pillow-simd; sys_platform == 'linux' and platform_machine == 'x86_64'
 imutils>=0.5.0
-# opencv-python is not available on armhf
-# locked to version because 4.8.0.76 is broken.
-opencv-python==4.8.0.74; sys_platform != 'linux' or platform_machine == 'x86_64' or platform_machine == 'aarch64'
+opencv-python-headless==4.10.0.84
+Pillow==10.3.0

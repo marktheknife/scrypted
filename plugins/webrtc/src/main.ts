@@ -1,25 +1,24 @@
 import { AutoenableMixinProvider } from '@scrypted/common/src/autoenable-mixin-provider';
 import { Deferred } from '@scrypted/common/src/deferred';
-import { listenZeroSingleClient } from '@scrypted/common/src/listen-cluster';
 import { timeoutPromise } from '@scrypted/common/src/promise-utils';
-import { createBrowserSignalingSession } from "@scrypted/common/src/rtc-connect";
 import { legacyGetSignalingSessionOptions } from '@scrypted/common/src/rtc-signaling';
 import { SettingsMixinDeviceBase, SettingsMixinDeviceOptions } from '@scrypted/common/src/settings-mixin';
 import { createZygote } from '@scrypted/common/src/zygote';
-import sdk, { BufferConverter, ConnectOptions, DeviceCreator, DeviceCreatorSettings, DeviceProvider, FFmpegInput, HttpRequest, Intercom, MediaObject, MediaObjectOptions, MixinProvider, RTCSessionControl, RTCSignalingChannel, RTCSignalingClient, RTCSignalingOptions, RTCSignalingSession, RequestMediaStream, RequestMediaStreamOptions, ResponseMediaStreamOptions, ScryptedDeviceBase, ScryptedDeviceType, ScryptedInterface, ScryptedMimeTypes, Setting, SettingValue, Settings, VideoCamera, WritableDeviceState } from '@scrypted/sdk';
+import sdk, { DeviceCreator, DeviceCreatorSettings, DeviceProvider, FFmpegInput, Intercom, MediaConverter, MediaObject, MediaObjectOptions, MixinProvider, RTCSessionControl, RTCSignalingChannel, RTCSignalingClient, RTCSignalingOptions, RTCSignalingSession, RequestMediaStream, RequestMediaStreamOptions, ResponseMediaStreamOptions, ScryptedDeviceType, ScryptedInterface, ScryptedMimeTypes, ScryptedNativeId, Setting, SettingValue, Settings, VideoCamera, WritableDeviceState } from '@scrypted/sdk';
 import { StorageSettings } from '@scrypted/sdk/storage-settings';
 import crypto from 'crypto';
 import ip from 'ip';
 import net from 'net';
 import os from 'os';
+import worker_threads from 'worker_threads';
 import { DataChannelDebouncer } from './datachannel-debouncer';
-import { RTC_BRIDGE_NATIVE_ID, WebRTCConnectionManagement, createRTCPeerConnectionSink, createTrackForwarder } from "./ffmpeg-to-wrtc";
-import { stunServer, turnServer, weriftStunServer, weriftTurnServer } from './ice-servers';
+import { WebRTCConnectionManagement, createRTCPeerConnectionSink, createTrackForwarder } from "./ffmpeg-to-wrtc";
+import { stunServers, turnServers, weriftStunServers, weriftTurnServers } from './ice-servers';
 import { waitClosed } from './peerconnection-util';
 import { WebRTCCamera } from "./webrtc-camera";
 import { MediaStreamTrack, PeerConfig, RTCPeerConnection, defaultPeerConfig } from './werift';
 import { WeriftSignalingSession } from './werift-signaling-session';
-import { createRTCPeerConnectionSource, getRTCMediaStreamOptions } from './wrtc-to-rtsp';
+import { RTCPeerConnectionPipe, createRTCPeerConnectionSource, getRTCMediaStreamOptions } from './wrtc-to-rtsp';
 
 const { mediaManager, systemManager, deviceManager } = sdk;
 
@@ -29,7 +28,7 @@ defaultPeerConfig.headerExtensions = {
     audio: [],
 };
 
-const zygote = createZygote<ReturnType<typeof fork>>();
+const zygote = worker_threads.isMainThread ? createZygote<ReturnType<typeof fork>>() : undefined;
 
 class WebRTCMixin extends SettingsMixinDeviceBase<RTCSignalingClient & VideoCamera & RTCSignalingChannel & Intercom> implements RTCSignalingChannel, VideoCamera, Intercom {
     storageSettings = new StorageSettings(this, {});
@@ -55,6 +54,7 @@ class WebRTCMixin extends SettingsMixinDeviceBase<RTCSignalingClient & VideoCame
                 this.console,
                 undefined,
                 media,
+                this.plugin.storageSettings.values.requireOpus,
                 this.plugin.storageSettings.values.maximumCompatibilityMode,
                 this.plugin.getRTCConfiguration(),
                 await this.plugin.getWeriftConfiguration(),
@@ -78,7 +78,7 @@ class WebRTCMixin extends SettingsMixinDeviceBase<RTCSignalingClient & VideoCame
                 timeStart: Date.now(),
                 videoTransceiver: undefined,
                 audioTransceiver,
-                isLocalNetwork: undefined, destinationId: undefined, ipv4: undefined,
+                isLocalNetwork: undefined, destinationId: undefined, ipv4: undefined, type: undefined,
                 requestMediaStream: async () => media,
                 maximumCompatibilityMode: false,
                 clientOptions: undefined,
@@ -128,6 +128,7 @@ class WebRTCMixin extends SettingsMixinDeviceBase<RTCSignalingClient & VideoCame
             this.console,
             hasIntercom ? device : undefined,
             mo,
+            this.plugin.storageSettings.values.requireOpus,
             this.plugin.storageSettings.values.maximumCompatibilityMode,
             this.plugin.getRTCConfiguration(),
             await this.plugin.getWeriftConfiguration(options?.disableTurn),
@@ -154,15 +155,29 @@ class WebRTCMixin extends SettingsMixinDeviceBase<RTCSignalingClient & VideoCame
             return this.mixinDevice.getVideoStream(options);
         }
 
-        const { intercom, mediaObject, pcClose } = await createRTCPeerConnectionSource({
-            console: this.console,
+        const result = zygote();
+        this.plugin.activeConnections++;
+        result.worker.on('exit', () => {
+            this.plugin.activeConnections--;
+        });
+
+        const fork = await result.result;
+
+        const { getIntercom, mediaObject, pcClose } = await fork.createRTCPeerConnectionSource({
+            __json_copy_serialize_children: true,
+            nativeId: this.nativeId,
+            mixinId: this.id,
             mediaStreamOptions: this.createVideoStreamOptions(),
-            channel: this.mixinDevice,
+            startRTCSignalingSession: (session) => this.mixinDevice.startRTCSignalingSession(session),
             maximumCompatibilityMode: this.plugin.storageSettings.values.maximumCompatibilityMode,
         });
 
-        this.webrtcIntercom = intercom;
-        pcClose.finally(() => this.webrtcIntercom = undefined);
+        this.webrtcIntercom = getIntercom();
+        const pcc = pcClose();
+        pcc.finally(() => {
+            this.webrtcIntercom = undefined;
+            result.worker.terminate();
+        });
 
         return mediaObject;
     }
@@ -177,14 +192,8 @@ class WebRTCMixin extends SettingsMixinDeviceBase<RTCSignalingClient & VideoCame
     }
 }
 
-export class WebRTCPlugin extends AutoenableMixinProvider implements DeviceCreator, DeviceProvider, BufferConverter, MixinProvider, Settings {
+export class WebRTCPlugin extends AutoenableMixinProvider implements DeviceCreator, DeviceProvider, MediaConverter, MixinProvider, Settings {
     storageSettings = new StorageSettings(this, {
-        maximumCompatibilityMode: {
-            title: 'Maximum Compatibility Mode',
-            description: 'Enables maximum compatibility with WebRTC clients by using the most conservative transcode options.',
-            defaultValue: false,
-            type: 'boolean',
-        },
         iceInterfaceAddresses: {
             title: 'ICE Interface Addresses',
             description: 'The ICE interface addresses to bind and share with the peer.',
@@ -195,9 +204,22 @@ export class WebRTCPlugin extends AutoenableMixinProvider implements DeviceCreat
             ],
             defaultValue: 'Default',
         },
+        requireOpus: {
+            group: 'Advanced',
+            title: 'Require Opus Audio Codec',
+            type: 'boolean',
+        },
+        maximumCompatibilityMode: {
+            group: 'Advanced',
+            title: 'Maximum Compatibility Mode',
+            description: 'Debug: Enables maximum compatibility with WebRTC clients by transcoding to known safe reference codecs. This setting will automatically reset when the plugin or Scrypted restarts.',
+            defaultValue: false,
+            type: 'boolean',
+        },
         useTurnServer: {
+            group: 'Advanced',
             title: 'Use TURN Servers',
-            description: 'Use a intermediary server to send video streams. Reduces performance and should only be used with restrictive NATs.',
+            description: 'Uses a intermediary server to send video streams when necessary. Traverses around restrictive NATs.',
             type: 'boolean',
             defaultValue: true,
         },
@@ -211,20 +233,6 @@ export class WebRTCPlugin extends AutoenableMixinProvider implements DeviceCreat
                 }
             },
         },
-        rtcConfiguration: {
-            title: "Custom Client RTC Configuration",
-            type: 'textarea',
-            description: "RTCConfiguration that can be used to specify custom TURN and STUN servers. https://gist.github.com/koush/f7dafec7dbca04982a76db8243abc57e",
-        },
-        weriftConfiguration: {
-            title: "Custom Server RTC Configuration",
-            type: 'textarea',
-            description: "RTCConfiguration that can be used to specify custom TURN and STUN servers. https://gist.github.com/koush/631d38ac8647a86baaac7b22d863f010",
-        },
-        debugLog: {
-            title: 'Debug Log',
-            type: 'boolean',
-        },
         ipv4Ban: {
             group: 'Advanced',
             title: '6to4 Ban',
@@ -237,27 +245,41 @@ export class WebRTCPlugin extends AutoenableMixinProvider implements DeviceCreat
             ],
             combobox: true,
             multiple: true,
-        }
+        },
+        debugLog: {
+            group: 'Advanced',
+            title: 'Debug Log',
+            type: 'boolean',
+        },
+        rtcConfiguration: {
+            group: 'Advanced',
+            title: "Custom Client RTC Configuration",
+            type: 'textarea',
+            description: "RTCConfiguration that can be used to specify custom TURN and STUN servers. https://gist.github.com/koush/f7dafec7dbca04982a76db8243abc57e",
+        },
+        weriftConfiguration: {
+            group: 'Advanced',
+            title: "Custom Server RTC Configuration",
+            type: 'textarea',
+            description: "RTCConfiguration that can be used to specify custom TURN and STUN servers. https://gist.github.com/koush/631d38ac8647a86baaac7b22d863f010",
+        },
     });
-    bridge: WebRTCBridge;
     activeConnections = 0;
 
     constructor() {
         super();
         this.unshiftMixin = true;
 
-        this.fromMimeType = '*/*';
-        this.toMimeType = ScryptedMimeTypes.RTCSignalingChannel;
+        // never want this on, should only be used for debugging.
+        this.storageSettings.values.maximumCompatibilityMode = false;
 
-        deviceManager.onDeviceDiscovered({
-            name: 'RTC Connection Bridge',
-            type: ScryptedDeviceType.API,
-            nativeId: RTC_BRIDGE_NATIVE_ID,
-            interfaces: [
-                ScryptedInterface.BufferConverter,
-            ],
-        })
-            .then(() => this.bridge = new WebRTCBridge(this, RTC_BRIDGE_NATIVE_ID));
+        this.converters = [
+            ["*/*", ScryptedMimeTypes.RTCSignalingChannel],
+            [ScryptedMimeTypes.RTCSignalingSession, ScryptedMimeTypes.RTCConnectionManagement],
+            [ScryptedMimeTypes.RTCSignalingChannel, ScryptedMimeTypes.FFmpegInput],
+        ]
+
+        deviceManager.onDevicesChanged({ devices: [] });
     }
 
     getSettings(): Promise<Setting[]> {
@@ -268,13 +290,25 @@ export class WebRTCPlugin extends AutoenableMixinProvider implements DeviceCreat
         return this.storageSettings.putSetting(key, value);
     }
 
-    async convert(data: any, fromMimeType: string, toMimeType: string, options?: MediaObjectOptions): Promise<RTCSignalingChannel> {
+    async convertToSignalingChannel(data: any, fromMimeType: string, toMimeType: string, options?: MediaObjectOptions): Promise<RTCSignalingChannel> {
         const plugin = this;
 
         const console = deviceManager.getMixinConsole(options?.sourceId, this.nativeId);
 
+        if (fromMimeType !== ScryptedMimeTypes.FFmpegInput && fromMimeType !== ScryptedMimeTypes.RequestMediaStream) {
+            try {
+                const mo = await mediaManager.createMediaObject(data, fromMimeType);
+                data = await mediaManager.convertMediaObjectToJSON<FFmpegInput>(mo, ScryptedMimeTypes.FFmpegInput);
+            }
+            catch (e) {
+                console.error('failed to create media object:', e);
+                throw new Error(`@scrypted/webrtc is unable to convert ${fromMimeType} to ${ScryptedMimeTypes.RTCSignalingChannel}`);
+            }
+            fromMimeType = ScryptedMimeTypes.FFmpegInput;
+        }
+
         if (fromMimeType === ScryptedMimeTypes.FFmpegInput) {
-            const ffmpegInput: FFmpegInput = JSON.parse(data.toString());
+            const ffmpegInput: FFmpegInput = typeof data === 'object' && !Buffer.isBuffer(data) ? data : JSON.parse(data.toString());
             const mo = await mediaManager.createFFmpegMediaObject(ffmpegInput);
 
             class OnDemandSignalingChannel implements RTCSignalingChannel {
@@ -282,6 +316,7 @@ export class WebRTCPlugin extends AutoenableMixinProvider implements DeviceCreat
                     return createRTCPeerConnectionSink(session, console,
                         undefined,
                         mo,
+                        plugin.storageSettings.values.requireOpus,
                         plugin.storageSettings.values.maximumCompatibilityMode,
                         plugin.getRTCConfiguration(),
                         await plugin.getWeriftConfiguration(),
@@ -291,25 +326,118 @@ export class WebRTCPlugin extends AutoenableMixinProvider implements DeviceCreat
 
             return new OnDemandSignalingChannel();
         }
-        else if (fromMimeType === ScryptedMimeTypes.RequestMediaStream) {
-            const rms = data as RequestMediaStream;
-            const mo = await mediaManager.createMediaObject(rms, ScryptedMimeTypes.RequestMediaStream);
-            class OnDemandSignalingChannel implements RTCSignalingChannel {
-                async startRTCSignalingSession(session: RTCSignalingSession): Promise<RTCSessionControl> {
-                    return createRTCPeerConnectionSink(session, console,
-                        undefined,
-                        mo,
-                        plugin.storageSettings.values.maximumCompatibilityMode,
-                        plugin.getRTCConfiguration(),
-                        await plugin.getWeriftConfiguration(),
-                    );
-                }
-            }
 
-            return new OnDemandSignalingChannel();
+        const rms = data as RequestMediaStream;
+        const mo = await mediaManager.createMediaObject(rms, ScryptedMimeTypes.RequestMediaStream);
+        class OnDemandSignalingChannel implements RTCSignalingChannel {
+            async startRTCSignalingSession(session: RTCSignalingSession): Promise<RTCSessionControl> {
+                return createRTCPeerConnectionSink(session, console,
+                    undefined,
+                    mo,
+                    plugin.storageSettings.values.requireOpus,
+                    plugin.storageSettings.values.maximumCompatibilityMode,
+                    plugin.getRTCConfiguration(),
+                    await plugin.getWeriftConfiguration(),
+                );
+            }
+        }
+
+        return new OnDemandSignalingChannel();
+    }
+
+    async convertToRTCConnectionManagement(result: ReturnType<typeof zygote>, data: any, fromMimeType: string, toMimeType: string, options?: MediaObjectOptions) {
+        const weriftConfiguration = await this.getWeriftConfiguration();
+        const session = data as RTCSignalingSession;
+        const maximumCompatibilityMode = !!this.storageSettings.values.maximumCompatibilityMode;
+        const clientOptions = await legacyGetSignalingSessionOptions(session);
+
+        let connection: WebRTCConnectionManagement;
+        try {
+            const { createConnection } = await result.result;
+            connection = await createConnection({}, undefined, session,
+                this.storageSettings.values.requireOpus,
+                maximumCompatibilityMode,
+                clientOptions,
+                {
+                    configuration: this.getRTCConfiguration(),
+                    weriftConfiguration,
+                    ipv4Ban: this.storageSettings.values.ipv4Ban,
+                }
+            );
+        }
+        catch (e) {
+            result.worker.terminate();
+            throw e;
+        }
+        await connection.negotiateRTCSignalingSession();
+        await connection.waitConnected();
+
+        return connection;
+    }
+
+    async convertToFFmpegInput(result: ReturnType<typeof zygote>, data: any, fromMimeType: string, toMimeType: string, options?: MediaObjectOptions) {
+        const channel = data as RTCSignalingChannel;
+        try {
+            const { createRTCPeerConnectionSource } = await result.result;
+            const rtcSource = await createRTCPeerConnectionSource({
+                __json_copy_serialize_children: true,
+                nativeId: undefined,
+                mixinId: undefined,
+                mediaStreamOptions: {
+                    id: 'webrtc',
+                    name: 'WebRTC',
+                    source: 'cloud',
+                },
+                startRTCSignalingSession: (session) => channel.startRTCSignalingSession(session),
+                maximumCompatibilityMode: this.storageSettings.values.maximumCompatibilityMode,
+            });
+
+            const mediaStreamUrl = rtcSource.mediaObject;
+            return await mediaManager.convertMediaObjectToJSON<FFmpegInput>(mediaStreamUrl, ScryptedMimeTypes.FFmpegInput);
+        } catch (e) {
+            result.worker.terminate();
+            throw e;
+        }
+    }
+
+    async convertMedia(data: any, fromMimeType: string, toMimeType: string, options?: MediaObjectOptions) {
+        const createTrackedFork = () => {
+            const result = zygote();
+            this.activeConnections++;
+            result.worker.on('exit', () => {
+                this.activeConnections--;
+            });
+            return result;
+        }
+
+        if (fromMimeType === ScryptedMimeTypes.RTCSignalingSession && toMimeType === ScryptedMimeTypes.RTCConnectionManagement) {
+            const result = createTrackedFork();
+            try {
+                const connection = await timeoutPromise(2 * 60 * 1000, this.convertToRTCConnectionManagement(result, data, fromMimeType, toMimeType, options));
+                // wait a bit to allow ffmpegs to get terminated by the thread.
+                connection.waitClosed().finally(() => setTimeout(() => result.worker.terminate(), 30000));
+                return connection;
+            }
+            catch (e) {
+                result.worker.terminate();
+                throw e;
+            }
+        }
+        else if (fromMimeType === ScryptedMimeTypes.RTCSignalingChannel && toMimeType === ScryptedMimeTypes.FFmpegInput) {
+            const result = createTrackedFork();
+            try {
+                return await timeoutPromise(2 * 60 * 1000, this.convertToFFmpegInput(result, data, fromMimeType, toMimeType, options));
+            }
+            catch (e) {
+                result.worker.terminate();
+                throw e;
+            }
+        }
+        else if (toMimeType === ScryptedMimeTypes.RTCSignalingChannel) {
+            return this.convertToSignalingChannel(data, fromMimeType, toMimeType, options);
         }
         else {
-            throw new Error(`@scrypted/webrtc is unable to convert ${fromMimeType} to ${ScryptedMimeTypes.RTCSignalingChannel}`);
+            throw new Error(`@scrypted/webrtc is unable to convert ${fromMimeType} to ${toMimeType}`);
         }
     }
 
@@ -401,8 +529,6 @@ export class WebRTCPlugin extends AutoenableMixinProvider implements DeviceCreat
     }
 
     async getDevice(nativeId: string) {
-        if (nativeId === RTC_BRIDGE_NATIVE_ID)
-            return this.bridge;
         return new WebRTCCamera(this, nativeId);
     }
 
@@ -419,7 +545,7 @@ export class WebRTCPlugin extends AutoenableMixinProvider implements DeviceCreat
             }
         }
         // google seems to be throttling requests on their open stun server... using a hosted one seems faster.
-        const iceServers = this.storageSettings.values.useTurnServer ? [turnServer] : [stunServer];
+        const iceServers = this.storageSettings.values.useTurnServer ? [...turnServers] : [...stunServers];
         return {
             iceServers,
         };
@@ -437,8 +563,8 @@ export class WebRTCPlugin extends AutoenableMixinProvider implements DeviceCreat
         }
 
         const iceServers = this.storageSettings.values.useTurnServer && !disableTurn
-            ? [weriftStunServer, weriftTurnServer]
-            : [weriftStunServer];
+            ? [...weriftStunServers, ...weriftTurnServers]
+            : [...weriftStunServers];
 
         let iceAdditionalHostAddresses: string[];
         let iceUseIpv4: boolean;
@@ -483,105 +609,31 @@ export class WebRTCPlugin extends AutoenableMixinProvider implements DeviceCreat
             ...ret,
         };
     }
-
-    async onConnection(request: HttpRequest, webSocketUrl: string) {
-        const cleanup = new Deferred<string>();
-        cleanup.promise.then(e => this.console.log('cleaning up rtc connection:', e));
-
-        try {
-            const ws = new WebSocket(webSocketUrl);
-            cleanup.promise.finally(() => ws.close());
-
-            if (request.isPublicEndpoint) {
-                cleanup.resolve('public endpoint not supported');
-                return;
-            }
-
-            const client = await listenZeroSingleClient();
-            cleanup.promise.finally(() => {
-                client.cancel();
-                client.clientPromise.then(cp => cp.destroy()).catch(() => { });
-            });
-
-            const message = await new Promise<{
-                connectionManagementId: string,
-                updateSessionId: string,
-            } & ConnectOptions>((resolve, reject) => {
-                const close = () => {
-                    const str = 'Connection closed while waiting for message';
-                    reject(new Error(str));
-                    cleanup.resolve(str);
-                };
-                ws.addEventListener('close', close);
-
-                ws.onmessage = message => {
-                    ws.removeEventListener('close', close);
-                    resolve(JSON.parse(message.data));
-                }
-            });
-
-            message.username = request.username;
-
-            const { connectionManagementId, updateSessionId } = message;
-            if (connectionManagementId) {
-                cleanup.promise.finally(async () => {
-                    const plugins = await systemManager.getComponent('plugins');
-                    plugins.setHostParam('@scrypted/webrtc', connectionManagementId);
-                });
-            }
-            if (updateSessionId) {
-                cleanup.promise.finally(async () => {
-                    const plugins = await systemManager.getComponent('plugins');
-                    plugins.setHostParam('@scrypted/webrtc', updateSessionId);
-                });
-            }
-
-            const session = await createBrowserSignalingSession(ws, '@scrypted/webrtc', 'remote');
-            const clientOptions = await legacyGetSignalingSessionOptions(session);
-
-            const result = zygote();
-            this.activeConnections++;
-            result.worker.on('exit', () => {
-                this.activeConnections--;
-                cleanup.resolve('worker exited');
-            });
-            cleanup.promise.finally(() => {
-                result.worker.terminate()
-            });
-
-            const { createConnection } = await result.result;
-            const connection = await createConnection(message, client.port, session,
-                this.storageSettings.values.maximumCompatibilityMode, clientOptions, {
-                configuration: this.getRTCConfiguration(),
-                weriftConfiguration: await this.getWeriftConfiguration(),
-                ipv4Ban: this.storageSettings.values.ipv4Ban,
-            });
-            cleanup.promise.finally(() => connection.close().catch(() => { }));
-            connection.waitClosed().finally(() => cleanup.resolve('peer connection closed'));
-
-            timeoutPromise(60000, connection.waitConnected())
-                .catch(() => {
-                    cleanup.resolve('timeout');
-                });
-
-            await connection.negotiateRTCSignalingSession();
-
-            const cp = await client.clientPromise;
-            cp.on('close', () => cleanup.resolve('socket client closed'));
-            sdk.connect(cp, message);
-        }
-        catch (e) {
-            console.error("error negotiating browser RTCC signaling", e);
-            cleanup.resolve('error');
-        }
-    }
 }
 
 export async function fork() {
     return {
+        async createRTCPeerConnectionSource(options: {
+            __json_copy_serialize_children: true,
+            mixinId: string,
+            nativeId: ScryptedNativeId,
+            mediaStreamOptions: ResponseMediaStreamOptions,
+            startRTCSignalingSession: (session: RTCSignalingSession) => Promise<RTCSessionControl | undefined>,
+            maximumCompatibilityMode: boolean,
+        }): Promise<RTCPeerConnectionPipe> {
+            return createRTCPeerConnectionSource({
+                nativeId: this.nativeId,
+                mixinId: options.mixinId,
+                mediaStreamOptions: options.mediaStreamOptions,
+                startRTCSignalingSession: (session) => options.startRTCSignalingSession(session),
+                maximumCompatibilityMode: options.maximumCompatibilityMode,
+            });
+        },
+
         async createConnection(message: any,
             port: number,
             clientSession: RTCSignalingSession,
+            requireOpus,
             maximumCompatibilityMode: boolean,
             clientOptions: RTCSignalingOptions,
             options: {
@@ -625,9 +677,9 @@ export async function fork() {
 
             const cleanup = new Deferred<string>();
             cleanup.promise.catch(e => this.console.log('cleaning up rtc connection:', e.message));
-            cleanup.promise.finally(() => setTimeout(() => process.exit(), 10000));
 
-            const connection = new WebRTCConnectionManagement(console, clientSession, maximumCompatibilityMode, clientOptions, options);
+            const connection = new WebRTCConnectionManagement(console, clientSession, requireOpus, maximumCompatibilityMode, clientOptions, options);
+            cleanup.promise.finally(() => connection.close().catch(() => { }));
             const { pc } = connection;
             waitClosed(pc).then(() => cleanup.resolve('peer connection closed'));
 
@@ -647,7 +699,7 @@ export async function fork() {
                 cleanup.promise.finally(() => socket.destroy());
 
                 const dc = pc.createDataChannel('rpc');
-                dc.message.subscribe(message => socket.write(message));
+                dc.onMessage.subscribe(message => socket.write(message));
 
                 const debouncer = new DataChannelDebouncer({
                     send: u8 => dc.send(Buffer.from(u8)),
@@ -665,53 +717,6 @@ export async function fork() {
 
             return connection;
         }
-    }
-}
-
-class WebRTCBridge extends ScryptedDeviceBase implements BufferConverter {
-    constructor(public plugin: WebRTCPlugin, nativeId: string) {
-        super(nativeId);
-
-        this.fromMimeType = ScryptedMimeTypes.RTCSignalingSession;
-        this.toMimeType = ScryptedMimeTypes.RTCConnectionManagement;
-    }
-
-    async convert(data: any, fromMimeType: string, toMimeType: string, options?: MediaObjectOptions): Promise<any> {
-        const session = data as RTCSignalingSession;
-        const maximumCompatibilityMode = !!this.plugin.storageSettings.values.maximumCompatibilityMode;
-        const clientOptions = await legacyGetSignalingSessionOptions(session);
-
-        const result = zygote();
-
-        const cleanup = new Deferred<string>();
-
-        this.plugin.activeConnections++;
-        result.worker.on('exit', () => {
-            this.plugin.activeConnections--;
-            cleanup.resolve('worker exited');
-        });
-        cleanup.promise.finally(() => {
-            result.worker.terminate()
-        });
-
-        const { createConnection } = await result.result;
-        const connection = await createConnection({}, undefined, session,
-            maximumCompatibilityMode,
-            clientOptions,
-            {
-                configuration: this.plugin.getRTCConfiguration(),
-                weriftConfiguration: await this.plugin.getWeriftConfiguration(),
-                ipv4Ban: this.plugin.storageSettings.values.ipv4Ban,
-            }
-        );
-        cleanup.promise.finally(() => connection.close().catch(() => { }));
-        connection.waitClosed().finally(() => cleanup.resolve('peer connection closed'));
-        await connection.negotiateRTCSignalingSession();
-        await connection.waitConnected();
-
-        // await connection.negotiateRTCSignalingSession();
-
-        return connection;
     }
 }
 

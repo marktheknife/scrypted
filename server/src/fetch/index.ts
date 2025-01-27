@@ -1,13 +1,16 @@
-
 export type HttpFetchResponseType = 'json' | 'text' | 'buffer' | 'readable';
 export interface HttpFetchOptionsBase<B> {
     url: string | URL;
     family?: 4 | 6;
     method?: string;
     headers?: HeadersInit;
+    signal?: AbortSignal,
     timeout?: number;
     rejectUnauthorized?: boolean;
-    ignoreStatusCode?: boolean;
+    /**
+     * Checks the status code. Defaults to true.
+     */
+    checkStatusCode?: boolean | ((statusCode: number) => boolean);
     body?: B | string | ArrayBufferView | any;
     withCredentials?: boolean;
 }
@@ -40,6 +43,7 @@ export function fetchStatusCodeOk(statusCode: number) {
 export function checkStatus(statusCode: number) {
     if (!fetchStatusCodeOk(statusCode))
         throw new Error(`http response statusCode ${statusCode}`);
+    return true;
 }
 
 export function getFetchMethod(options: HttpFetchOptions<any>) {
@@ -62,7 +66,7 @@ export type fetcher<B, M> = <T extends HttpFetchOptions<B>>(options: T) => Promi
 >>;
 
 
-export function getHttpFetchAccept(responseType: HttpFetchResponseType) {
+export function getHttpFetchAccept(responseType: HttpFetchResponseType | undefined) {
     switch (responseType) {
         case 'json':
             return 'application/json';
@@ -72,16 +76,65 @@ export function getHttpFetchAccept(responseType: HttpFetchResponseType) {
     return;
 }
 
-export function setDefaultHttpFetchAccept(headers: Headers, responseType: HttpFetchResponseType) {
-    if (headers.has('Accept'))
+export function hasHeader(headers: [string, string][], key: string) {
+    key = key.toLowerCase();
+    return headers.find(([k]) => k.toLowerCase() === key);
+}
+
+export function removeHeader(headers: [string, string][], key: string) {
+    key = key.toLowerCase();
+    const filteredHeaders = headers.filter(([headerKey, _]) => headerKey.toLowerCase() !== key);
+    headers.length = 0;
+    filteredHeaders.forEach(header => headers.push(header));
+}
+
+export function setHeader(headers: [string, string][], key: string, value: string) {
+    removeHeader(headers, key);
+    headers.push([key, value]);
+}
+
+export function setDefaultHttpFetchAccept(headers: [string, string][], responseType: HttpFetchResponseType | undefined) {
+    if (hasHeader(headers, 'Accept'))
         return;
     const accept = getHttpFetchAccept(responseType);
     if (accept)
-        headers.set('Accept', accept);
+        setHeader(headers, 'Accept', accept);
 }
 
-export function createStringOrBufferBody(headers: Headers, body: any) {
-    let contentType: string;
+export function createHeadersArray(headers: HeadersInit | undefined): [string, string][] {
+    const headersArray: [string, string][] = [];
+    if (!headers)
+        return headersArray;
+    if (headers instanceof Headers) {
+        for (const [k, v] of headers.entries()) {
+            headersArray.push([k, v]);
+        }
+        return headersArray;
+    }
+
+    if (headers instanceof Array) {
+        for (const [k, v] of headers) {
+            headersArray.push([k, v]);
+        }
+        return headersArray;
+    }
+
+    for (const k of Object.keys(headers)) {
+        const v = headers[k];
+        headersArray.push([k, v]);
+    }
+
+    return headersArray;
+}
+
+/**
+ *
+ * @param headers
+ * @param body
+ * @returns Returns the body and Content-Type header that was set.
+ */
+export function createStringOrBufferBody(headers: [string, string][], body: any) {
+    let contentType: string | undefined;
     if (typeof body === 'object') {
         body = JSON.stringify(body);
         contentType = 'application/json';
@@ -90,13 +143,17 @@ export function createStringOrBufferBody(headers: Headers, body: any) {
         contentType = 'text/plain';
     }
 
-    if (!headers.has('Content-Type'))
-        headers.set('Content-Type', contentType);
+    if (contentType && !hasHeader(headers, 'Content-Type'))
+        setHeader(headers, 'Content-Type', contentType);
 
+    if (!hasHeader(headers, 'Content-Length')) {
+        body = Buffer.from(body);
+        setHeader(headers, 'Content-Length', body.length.toString());
+    }
     return body;
 }
 
-export async function domFetchParseIncomingMessage(response: Response, responseType: HttpFetchResponseType) {
+export async function domFetchParseIncomingMessage(response: Response, responseType: HttpFetchResponseType | undefined) {
     switch (responseType) {
         case 'json':
             return response.json();
@@ -115,7 +172,7 @@ export async function domFetch<T extends HttpFetchOptions<BodyInit>>(options: T)
     : T extends HttpFetchReadableOptions<BodyInit> ? Response
     : T extends HttpFetchJsonOptions<BodyInit> ? any : Buffer
 >> {
-    const headers = new Headers(options.headers);
+    const headers = createHeadersArray(options.headers);
     setDefaultHttpFetchAccept(headers, options.responseType);
 
     let { body } = options;
@@ -123,57 +180,44 @@ export async function domFetch<T extends HttpFetchOptions<BodyInit>>(options: T)
         body = createStringOrBufferBody(headers, body);
     }
 
-    const { url } = options;
-    const response = await fetch(url, {
-        method: getFetchMethod(options),
-        credentials: options.withCredentials ? 'include' : undefined,
-        headers,
-        signal: options.timeout ? AbortSignal.timeout(options.timeout) : undefined,
-        body,
-    });
+    let controller: AbortController | undefined;
+    let timeout: NodeJS.Timeout;
+    if (options.timeout) {
+        controller = new AbortController();
+        timeout = setTimeout(() => controller!.abort(), options.timeout);
 
-    if (!options?.ignoreStatusCode) {
-        try {
-            checkStatus(response.status);
-        }
-        catch (e) {
-            response.arrayBuffer().catch(() => { });
-            throw e;
-        }
+        options.signal?.addEventListener('abort', () => controller!.abort(options.signal?.reason));
     }
 
-    return {
-        statusCode: response.status,
-        headers: response.headers,
-        body: await domFetchParseIncomingMessage(response, options.responseType),
-    };
-}
+    try {
+        const { url } = options;
+        const response = await fetch(url, {
+            method: getFetchMethod(options),
+            credentials: options.withCredentials ? 'include' : undefined,
+            headers,
+            signal: controller?.signal || options.signal,
+            body,
+        });
 
-function ensureType<T>(v: T) {
-}
+        if (options?.checkStatusCode === undefined || options?.checkStatusCode) {
+            try {
+                const checker = typeof options?.checkStatusCode === 'function' ? options.checkStatusCode : checkStatus;
+                if (!checker(response.status))
+                    throw new Error(`http response statusCode ${response.status}`);
+            }
+            catch (e) {
+                response.arrayBuffer().catch(() => { });
+                throw e;
+            }
+        }
 
-async function test() {
-    const a = await domFetch({
-        url: 'http://example.com',
-    });
-
-    ensureType<Buffer>(a.body);
-
-    const b = await domFetch({
-        url: 'http://example.com',
-        responseType: 'json',
-    });
-    ensureType<any>(b.body);
-
-    const c = await domFetch({
-        url: 'http://example.com',
-        responseType: 'readable',
-    });
-    ensureType<Response>(c.body);
-
-    const d = await domFetch({
-        url: 'http://example.com',
-        responseType: 'buffer',
-    });
-    ensureType<Buffer>(d.body);
+        return {
+            statusCode: response.status,
+            headers: response.headers,
+            body: await domFetchParseIncomingMessage(response, options.responseType),
+        };
+    }
+    finally {
+        clearTimeout(timeout!);
+    }
 }

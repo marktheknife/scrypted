@@ -1,5 +1,5 @@
 import { EventDetails, ScryptedNativeId, SystemDeviceState } from '@scrypted/types'
-import { PluginRemote, PluginRemoteLoadZipOptions } from './plugin-api';
+import { PluginRemote, PluginRemoteLoadZipOptions, PluginZipAPI } from './plugin-api';
 
 /**
  * This remote is necessary as the host needs to create a remote synchronously
@@ -15,12 +15,13 @@ import { PluginRemote, PluginRemoteLoadZipOptions } from './plugin-api';
             this.remote = await remoteReadyPromise;
             return this.remote;
         })();
+        this.remoteReadyPromise.catch(() => {});
     }
 
-    async loadZip(packageJson: any, zipData: Buffer|string, options?: PluginRemoteLoadZipOptions): Promise<any> {
+    async loadZip(packageJson: any, zipAPI: PluginZipAPI, options?: PluginRemoteLoadZipOptions): Promise<any> {
         if (!this.remote)
             await this.remoteReadyPromise;
-        return this.remote.loadZip(packageJson, zipData, options);
+        return this.remote.loadZip(packageJson, zipAPI, options);
     }
     async setSystemState(state: { [id: string]: { [property: string]: SystemDeviceState; }; }): Promise<void> {
         if (!this.remote)
@@ -65,7 +66,7 @@ import { PluginRemote, PluginRemoteLoadZipOptions } from './plugin-api';
         return this.remote.createDeviceState(id, setState);
     }
 
-    async getServicePort(name: string, ...args: any[]): Promise<number> {
+    async getServicePort(name: string, ...args: any[]): Promise<[number, string]> {
         const remote = await this.remotePromise;
         return remote.getServicePort(name, ...args);
     }

@@ -1,5 +1,5 @@
 import sdk, { Device, DeviceCreator, DeviceCreatorSettings, DeviceProvider, Readme, ScryptedDeviceBase, ScryptedDeviceType, ScryptedInterface, Setting } from '@scrypted/sdk';
-import { AggregateDevice, createAggregateDevice } from './aggregate';
+import { AggregateDevice } from './aggregate';
 
 const { deviceManager } = sdk;
 export const AggregateCoreNativeId = 'aggregatecore';
@@ -10,23 +10,9 @@ export class AggregateCore extends ScryptedDeviceBase implements DeviceProvider,
     constructor() {
         super(AggregateCoreNativeId);
 
-        for (const nativeId of deviceManager.getNativeIds()) {
-            if (nativeId?.startsWith('aggregate:')) {
-                const aggregate = createAggregateDevice(nativeId);
-                this.aggregate.set(nativeId, aggregate);
-                this.reportAggregate(nativeId, aggregate.computeInterfaces(), aggregate.providedName);
-            }
-        }
-
-        sdk.systemManager.listen((eventSource, eventDetails, eventData) => {
-            if (eventDetails.eventInterface === 'Storage') {
-                const ids = [...this.aggregate.values()].map(a => a.id);
-                if (ids.includes(eventSource.id)) {
-                    const aggregate = [...this.aggregate.values()].find(a => a.id === eventSource.id);
-                    this.reportAggregate(aggregate.nativeId, aggregate.computeInterfaces(), aggregate.providedName);
-                }
-            }
-        });
+        this.systemDevice = {
+            deviceCreator: 'Device Group',
+        };
     }
 
     async getReadmeMarkdown(): Promise<string> {
@@ -47,7 +33,8 @@ export class AggregateCore extends ScryptedDeviceBase implements DeviceProvider,
         const { name } = settings;
         const nativeId = `aggregate:${Math.random()}`;
         await this.reportAggregate(nativeId, [], name?.toString());
-        const aggregate = createAggregateDevice(nativeId);
+        const aggregate = new AggregateDevice(this, nativeId);
+        aggregate.computeInterfaces();
         this.aggregate.set(nativeId, aggregate);
         return nativeId;
     }
@@ -64,9 +51,17 @@ export class AggregateCore extends ScryptedDeviceBase implements DeviceProvider,
     }
 
     async getDevice(nativeId: string) {
-        return this.aggregate.get(nativeId);
+        let device = this.aggregate.get(nativeId);
+        if (device)
+            return device;
+        device = new AggregateDevice(this, nativeId);
+        device.computeInterfaces();
+        this.aggregate.set(nativeId, device);
+        return device;
     }
 
     async releaseDevice(id: string, nativeId: string): Promise<void> {
+        const device = this.aggregate.get(nativeId);
+        device?.release();
     }
 }

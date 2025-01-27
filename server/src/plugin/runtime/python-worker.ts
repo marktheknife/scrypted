@@ -2,22 +2,56 @@ import child_process from 'child_process';
 import fs from "fs";
 import os from "os";
 import path from 'path';
-import { Readable, Writable } from 'stream';
+import { PortablePython } from 'py';
+import { PassThrough, Readable, Writable } from 'stream';
+import { installScryptedServerRequirements, version as packagedPythonVersion } from '../../../bin/packaged-python';
 import { RpcMessage, RpcPeer } from "../../rpc";
 import { createRpcDuplexSerializer } from '../../rpc-serializer';
+import { getPluginVolume } from '../plugin-volume';
 import { ChildProcessWorker } from "./child-process-worker";
 import { RuntimeWorkerOptions } from "./runtime-worker";
 
 export class PythonRuntimeWorker extends ChildProcessWorker {
-    serializer: ReturnType<typeof createRpcDuplexSerializer>;
+    static {
+        if (!fs.existsSync(process.env.SCRYPTED_PYTHON_PATH)) {
+            try {
+                const py = new PortablePython(packagedPythonVersion);
+                const portablePython = py.executablePath;
+                // is this possible?
+                if (fs.existsSync(portablePython))
+                    process.env.SCRYPTED_PYTHON_PATH = portablePython;
+            }
+            catch (e) {
+            }
+        }
+    }
 
-    constructor(pluginId: string, options: RuntimeWorkerOptions) {
-        super(pluginId, options);
+    serializer: ReturnType<typeof createRpcDuplexSerializer>;
+    peerin: Writable;
+    peerout: Readable;
+    _stdout = new PassThrough();
+    _stderr = new PassThrough();
+    pythonInstallationComplete = true;
+
+    get stdout() {
+        return this._stdout;
+    }
+
+    get stderr() {
+        return this._stderr;
+    }
+
+    constructor(options: RuntimeWorkerOptions) {
+        super(options);
 
         const { env, pluginDebug } = options;
         const args: string[] = [
+            // unbuffered stdout/stderr
             '-u',
+            // prevent any global packages from being used
+            // '-S',
         ];
+
         if (pluginDebug) {
             args.push(
                 '-m',
@@ -27,8 +61,10 @@ export class PythonRuntimeWorker extends ChildProcessWorker {
                 '--wait-for-client',
             )
         }
+
         args.push(
             path.join(__dirname, '../../../python', 'plugin_remote.py'),
+            this.pluginId,
         )
 
         const gstEnv: NodeJS.ProcessEnv = {};
@@ -49,52 +85,109 @@ export class PythonRuntimeWorker extends ChildProcessWorker {
             }
         }
 
-        let pythonPath = process.env.SCRYPTED_PYTHON_PATH;
-        const pluginPythonVersion = options.packageJson.scrypted.pythonVersion?.[os.platform()]?.[os.arch()] || options.packageJson.scrypted.pythonVersion?.default;
+        let pythonPath = !process.env.SCRYPTED_PORTABLE_PYTHON && process.env.SCRYPTED_PYTHON_PATH;
 
-        if (os.platform() === 'win32') {
-            if (!pythonPath) {
+        if (!pythonPath) {
+            if (os.platform() === 'win32') {
                 pythonPath = 'py.exe';
-                const windowsPythonVersion = pluginPythonVersion || process.env.SCRYPTED_WINDOWS_PYTHON_VERSION;
-                if (windowsPythonVersion)
-                    args.unshift(windowsPythonVersion)
+            }
+            else {
+                pythonPath = 'python3';
             }
         }
-        else if (pluginPythonVersion) {
-            pythonPath = `python${pluginPythonVersion}`;
+
+        const setup = () => {
+            const types = require.resolve('@scrypted/types');
+            const PYTHONPATH = types.substring(0, types.indexOf('types') + 'types'.length);
+            this.worker = child_process.spawn(pythonPath, args, {
+                cwd: options.unzippedPath,
+                // stdin, stdout, stderr, peer in, peer out
+                stdio: ['pipe', 'pipe', 'pipe', 'pipe', 'pipe'],
+                env: Object.assign({}, process.env, env, gstEnv, {
+                    // rev this if the base python version or server characteristics change.
+                    SCRYPTED_PYTHON_VERSION: '20240317',
+                    PYTHONUNBUFFERED: '1',
+                    PYTHONPATH,
+                }),
+            });
+            this.setupWorker();
+
+            this.worker.stdout.pipe(this.stdout);
+            this.worker.stderr.pipe(this.stderr);
+        };
+
+        let pluginPythonVersion: string = options.packageJson.scrypted.pythonVersion?.[os.platform()]?.[os.arch()] || options.packageJson.scrypted.pythonVersion?.default;
+        if (process.env.SCRYPTED_PORTABLE_PYTHON && !pluginPythonVersion)
+            pluginPythonVersion = packagedPythonVersion;
+
+        let portablePythonOptions = options.packageJson.scrypted.pythonVersion?.options?.[os.platform()]?.[os.arch()] || options.packageJson.scrypted.pythonVersion?.options?.default || {};
+
+        // if the plugin requests a specific python, then install it via portable python
+        if (!pluginPythonVersion) {
+            setup();
+            this.peerin = this.worker.stdio[3] as Writable;
+            this.peerout = this.worker.stdio[4] as Readable;
+            return;
+        }
+
+        const strippedPythonVersion = pluginPythonVersion.replace('.', '');
+        const envPython = !process.env.SCRYPTED_PORTABLE_PYTHON && process.env[`SCRYPTED_PYTHON${strippedPythonVersion}_PATH`];
+        if (envPython && fs.existsSync(envPython)) {
+            pythonPath = envPython;
+            setup();
+            this.peerin = this.worker.stdio[3] as Writable;
+            this.peerout = this.worker.stdio[4] as Readable;
+            return;
+        }
+
+        const peerin = this.peerin = new PassThrough();
+        const peerout = this.peerout = new PassThrough();
+
+        const finishSetup = () => {
+            setup();
+
+            peerin.pipe(this.worker.stdio[3] as Writable);
+            (this.worker.stdio[4] as Readable).pipe(peerout);
+        };
+
+        const pyVersion = require('py/package.json').version;
+        const pyPath = path.join(getPluginVolume(this.pluginId), 'py');
+        const portableInstallPath = path.join(pyPath, pyVersion);
+
+        const py = new PortablePython(pluginPythonVersion, portableInstallPath, portablePythonOptions);
+        if (fs.existsSync(py.executablePath) && !py.isTagOutdated()) {
+            pythonPath = py.executablePath;
+            finishSetup();
         }
         else {
-            pythonPath ||= 'python3';
+            (async () => {
+                try {
+                    this.pythonInstallationComplete = false;
+                    await fs.promises.rm(pyPath, { recursive: true, force: true }).catch(() => { });
+                    pythonPath = await installScryptedServerRequirements(pluginPythonVersion, portableInstallPath, portablePythonOptions);
+                    finishSetup();
+                }
+                catch (e) {
+                    process.nextTick(() => {
+                        this.emit('error', new Error('Failed to install portable python.'));
+                    });
+                }
+                finally {
+                    this.pythonInstallationComplete = true
+                }
+            })();
         }
-
-        args.push(this.pluginId);
-
-        const types = require.resolve('@scrypted/types');
-        const PYTHONPATH = types.substring(0, types.indexOf('types') + 'types'.length);
-        this.worker = child_process.spawn(pythonPath, args, {
-            // stdin, stdout, stderr, peer in, peer out
-            stdio: ['pipe', 'pipe', 'pipe', 'pipe', 'pipe'],
-            env: Object.assign({
-                PYTHONUNBUFFERED: '1',
-                PYTHONPATH,
-            }, gstEnv, process.env, env),
-        });
-
-        this.setupWorker();
     }
 
     setupRpcPeer(peer: RpcPeer): void {
-        const peerin = this.worker.stdio[3] as Writable;
-        const peerout = this.worker.stdio[4] as Readable;
-
-        const serializer = this.serializer = createRpcDuplexSerializer(peerin);
+        const serializer = this.serializer = createRpcDuplexSerializer(this.peerin);
         serializer.setupRpcPeer(peer);
-        peerout.on('data', data => serializer.onData(data));
-        peerin.on('error', e => {
+        this.peerout.on('data', data => serializer.onData(data));
+        this.peerin.on('error', e => {
             this.emit('error', e);
             serializer.onDisconnected();
         });
-        peerout.on('error', e => {
+        this.peerout.on('error', e => {
             this.emit('error', e)
             serializer.onDisconnected();
         });
@@ -102,7 +195,7 @@ export class PythonRuntimeWorker extends ChildProcessWorker {
 
     send(message: RpcMessage, reject?: (e: Error) => void, serializationContext?: any): void {
         try {
-            if (!this.worker)
+            if (this.pythonInstallationComplete && !this.worker)
                 throw new Error('python worker has been killed');
             this.serializer.sendMessage(message, reject, serializationContext);
         }

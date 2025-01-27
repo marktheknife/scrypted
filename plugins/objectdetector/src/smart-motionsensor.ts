@@ -1,22 +1,18 @@
 import sdk, { Camera, EventListenerRegister, MediaObject, MotionSensor, ObjectDetector, ObjectsDetected, Readme, RequestPictureOptions, ResponsePictureOptions, ScryptedDevice, ScryptedDeviceBase, ScryptedDeviceType, ScryptedInterface, ScryptedNativeId, Setting, SettingValue, Settings } from "@scrypted/sdk";
-import { StorageSetting, StorageSettings } from "@scrypted/sdk/storage-settings";
+import { StorageSettings } from "@scrypted/sdk/storage-settings";
+import { levenshteinDistance } from "./edit-distance";
 import type { ObjectDetectionPlugin } from "./main";
 
 export const SMART_MOTIONSENSOR_PREFIX = 'smart-motionsensor-';
 
-export function createObjectDetectorStorageSetting(): StorageSetting {
-    return {
-        key: 'objectDetector',
-        title: 'Object Detector',
-        description: 'Select the camera or doorbell that provides smart detection event.',
-        type: 'device',
-        deviceFilter: `(type === '${ScryptedDeviceType.Doorbell}' || type === '${ScryptedDeviceType.Camera}') && interfaces.includes('${ScryptedInterface.ObjectDetector}')`,
-    };
-}
-
 export class SmartMotionSensor extends ScryptedDeviceBase implements Settings, Readme, MotionSensor, Camera {
     storageSettings = new StorageSettings(this, {
-        objectDetector: createObjectDetectorStorageSetting(),
+        objectDetector: {
+            title: 'Camera',
+            description: 'Select a camera or doorbell that provides smart detection events.',
+            type: 'device',
+            deviceFilter: `(type === '${ScryptedDeviceType.Doorbell}' || type === '${ScryptedDeviceType.Camera}') && interfaces.includes('${ScryptedInterface.ObjectDetector}')`,
+        },
         detections: {
             title: 'Detections',
             description: 'The detections that will trigger this smart motion sensor.',
@@ -25,7 +21,7 @@ export class SmartMotionSensor extends ScryptedDeviceBase implements Settings, R
         },
         detectionTimeout: {
             title: 'Object Detection Timeout',
-            description: 'Duration in seconds the sensor will report motion, before resetting.',
+            description: 'Duration in seconds the sensor will report motion, before resetting. Setting this to 0 will reset the sensor when motion stops.',
             type: 'number',
             defaultValue: 60,
         },
@@ -43,9 +39,44 @@ export class SmartMotionSensor extends ScryptedDeviceBase implements Settings, R
             type: 'number',
             defaultValue: 0.7,
         },
+        requireDetectionThumbnail: {
+            title: 'Require Detections with Images',
+            description: 'When enabled, this sensor will ignore detections results that do not have images.',
+            type: 'boolean',
+            defaultValue: false,
+        },
+        requireScryptedNvrDetections: {
+            title: 'Require Scrypted Detections',
+            description: 'When enabled, this sensor will ignore onboard camera detections.',
+            type: 'boolean',
+            defaultValue: false,
+        },
+        labels: {
+            group: 'Recognition',
+            title: 'Labels',
+            description: 'The labels (license numbers, names) that will trigger this smart motion sensor.',
+            multiple: true,
+            combobox: true,
+            choices: [],
+        },
+        labelDistance: {
+            group: 'Recognition',
+            title: 'Label Distance',
+            description: 'The maximum edit distance between the detected label and the desired label. Ie, a distance of 1 will match "abcde" to "abcbe" or "abcd".',
+            type: 'number',
+            defaultValue: 2,
+        },
+        labelScore: {
+            group: 'Recognition',
+            title: 'Label Score',
+            description: 'The minimum score required for a label to trigger the motion sensor.',
+            type: 'number',
+            defaultValue: 0,
+        }
     });
 
-    listener: EventListenerRegister;
+    detectionListener: EventListenerRegister;
+    motionListener: EventListenerRegister;
     timeout: NodeJS.Timeout;
     lastPicture: Promise<MediaObject>;
 
@@ -54,7 +85,7 @@ export class SmartMotionSensor extends ScryptedDeviceBase implements Settings, R
 
         this.storageSettings.settings.detections.onGet = async () => {
             const objectDetector: ObjectDetector = this.storageSettings.values.objectDetector;
-            const choices = (await objectDetector?.getObjectTypes())?.classes || [];
+            const choices = (await objectDetector?.getObjectTypes?.())?.classes || [];
             return {
                 hide: !objectDetector,
                 choices,
@@ -108,15 +139,17 @@ export class SmartMotionSensor extends ScryptedDeviceBase implements Settings, R
         return;
     }
 
-    resetTrigger() {
+    resetMotionTimeout() {
         clearTimeout(this.timeout);
         this.timeout = undefined;
     }
 
     trigger() {
-        this.resetTrigger();
-        const duration: number = this.storageSettings.values.detectionTimeout;
+        this.resetMotionTimeout();
         this.motionDetected = true;
+        const duration: number = this.storageSettings.values.detectionTimeout;
+        if (!duration)
+            return;
         this.timeout = setTimeout(() => {
             this.motionDetected = false;
         }, duration * 1000);
@@ -124,12 +157,14 @@ export class SmartMotionSensor extends ScryptedDeviceBase implements Settings, R
 
     rebind() {
         this.motionDetected = false;
-        this.listener?.removeListener();
-        this.listener = undefined;
-        this.resetTrigger();
+        this.detectionListener?.removeListener();
+        this.detectionListener = undefined;
+        this.motionListener?.removeListener();
+        this.motionListener = undefined;
+        this.resetMotionTimeout();
 
 
-        const objectDetector: ObjectDetector & ScryptedDevice = this.storageSettings.values.objectDetector;
+        const objectDetector: ObjectDetector & MotionSensor & ScryptedDevice = this.storageSettings.values.objectDetector;
         if (!objectDetector)
             return;
 
@@ -137,11 +172,29 @@ export class SmartMotionSensor extends ScryptedDeviceBase implements Settings, R
         if (!detections?.length)
             return;
 
-        const console = sdk.deviceManager.getMixinConsole(objectDetector.id, this.nativeId);
+        this.motionListener = objectDetector.listen({
+            event: ScryptedInterface.MotionSensor,
+            watch: true,
+        }, (source, details, data) => {
+            const duration: number = this.storageSettings.values.detectionTimeout;
+            if (duration)
+                return;
 
-        this.listener = objectDetector.listen(ScryptedInterface.ObjectDetector, (source, details, data) => {
+            if (!objectDetector.motionDetected)
+                this.motionDetected = false;
+        });
+
+        this.detectionListener = objectDetector.listen(ScryptedInterface.ObjectDetector, (source, details, data) => {
             const detected: ObjectsDetected = data;
+
+            if (this.storageSettings.values.requireDetectionThumbnail && !detected.detectionId)
+                return false;
+
+            const { labels, labelDistance, labelScore } = this.storageSettings.values;
+
             const match = detected.detections?.find(d => {
+                if (this.storageSettings.values.requireScryptedNvrDetections && !d.boundingBox)
+                    return false;
                 if (d.score && d.score < this.storageSettings.values.minScore)
                     return false;
                 if (!detections.includes(d.className))
@@ -163,13 +216,41 @@ export class SmartMotionSensor extends ScryptedDeviceBase implements Settings, R
                         this.console.warn('Camera does not provide Zones in detection event. Zone filter will not be applied.');
                     }
                 }
-                if (!d.movement)
-                    return true;
-                return d.movement.moving;
-            })
+
+                // when not searching for a label, validate the object is moving.
+                if (!labels?.length)
+                    return !d.movement || d.movement.moving;
+
+                if (!d.label)
+                    return false;
+
+                for (const label of labels) {
+                    if (label === d.label) {
+                        if (!labelScore || d.labelScore >= labelScore)
+                            return true;
+                        this.console.log('Label score too low.', d.labelScore);
+                        continue;
+                    }
+
+                    if (!labelDistance)
+                        continue;
+
+                    if (levenshteinDistance(label, d.label) > labelDistance) {
+                        this.console.log('Label does not match.', label, d.label, d.labelScore);
+                        continue;
+                    }
+
+                    if (!labelScore || d.labelScore >= labelScore)
+                        return true;
+                    this.console.log('Label score too low.', d.labelScore);
+                }
+
+                return false;
+            });
+
             if (match) {
                 if (!this.motionDetected)
-                    console.log('Smart Motion Sensor triggered on', match);
+                    this.console.log('Smart Motion Sensor triggered on', match);
                 if (detected.detectionId)
                     this.lastPicture = objectDetector.getDetectionInput(detected.detectionId, details.eventId);
                 this.trigger();
@@ -189,6 +270,6 @@ export class SmartMotionSensor extends ScryptedDeviceBase implements Settings, R
         return `
 ## Smart Motion Sensor
 
-This Smart Motion Sensor can trigger when a specific type of object (car, person, dog, etc) triggers movement on a camera. The sensor can then be synced to other platforms such as HomeKit, Google Home, Alexa, or Home Assistant for use in automations. This Sensor requires a camera with hardware or software object detection capability.`;
+This Smart Motion Sensor can trigger when a specific type of object (vehicle, person, animal, etc) triggers movement on a camera. The sensor can then be synced to other platforms such as HomeKit, Google Home, Alexa, or Home Assistant for use in automations. This Sensor requires a camera with hardware or software object detection capability.`;
     }
 }

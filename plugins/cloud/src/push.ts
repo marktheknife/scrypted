@@ -1,6 +1,7 @@
 import { EventEmitter } from 'events';
-import PushReceiver, { Types } from '@eneris/push-receiver';
+import { PushReceiver } from '@eneris/push-receiver';
 import { Deferred } from '@scrypted/common/src/deferred';
+import type { Types } from '@eneris/push-receiver/dist/client';
 
 export declare interface PushManager {
     on(event: 'message', listener: (data: any) => void): this;
@@ -9,6 +10,7 @@ export declare interface PushManager {
 
 export class PushManager extends EventEmitter {
     registrationId: Promise<string>;
+    currentRegistrationId: string;
 
     constructor(public senderId: string) {
         super();
@@ -27,7 +29,15 @@ export class PushManager extends EventEmitter {
 
             const instance = new PushReceiver({
                 ...savedConfig,
-                senderId,
+                firebase: {
+                    apiKey: "AIzaSyDI0bgFuVPIqKZoNpB-iTOU7ijIeepxOXE",
+                    authDomain: "scrypted-app.firebaseapp.com",
+                    databaseURL: "https://scrypted-app.firebaseio.com",
+                    projectId: "scrypted-app",
+                    storageBucket: "scrypted-app.appspot.com",
+                    messagingSenderId: "827888101440",
+                    appId: "1:827888101440:web:6ff9f8ada107e9cc0097a5"
+                },
                 heartbeatIntervalMs: 15 * 60 * 1000,
             });
 
@@ -38,11 +48,12 @@ export class PushManager extends EventEmitter {
             }
 
             const stopListeningToCredentials = instance.onCredentialsChanged(({ oldCredentials, newCredentials }) => {
+                this.currentRegistrationId = newCredentials.fcm.token;
                 savedConfig.credentials = newCredentials;
-                deferred.resolve(newCredentials.fcm.token);
-                this.registrationId = Promise.resolve(newCredentials.fcm.token);
+                deferred.resolve(this.currentRegistrationId);
+                this.registrationId = Promise.resolve( this.currentRegistrationId);
                 saveConfig();
-                this.emit('registrationId', newCredentials.fcm.token);
+                this.emit('registrationId',  this.currentRegistrationId);
             });
 
             const stopListeningToNotifications = instance.onNotification(({ message }) => {
@@ -51,7 +62,12 @@ export class PushManager extends EventEmitter {
                 this.emit('message', message.data);
             });
 
-            await instance.connect();
+            try {
+                await instance.connect();
+            }
+            catch (e) {
+                console.error('failed to connect to push server', e);
+            }
 
             return savedConfig.credentials?.fcm?.token || deferred.promise;
         })();

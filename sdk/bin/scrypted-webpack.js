@@ -9,23 +9,22 @@ catch (e) {
 const path = require('path');
 const process = require('process');
 const fs = require('fs');
-const spawn = require('child_process').spawn;
 const cwd = process.cwd();
 const AdmZip = require('adm-zip');
 const os = require('os');
 const rimraf = require('rimraf');
 const webpack = require('webpack');
-const esbuild = require('esbuild');
-const ncp = require('ncp');
 const tmp = require('tmp');
+const child_process = require('child_process');
+const { once } = require('events');
+
+let out;
+if (process.env.NODE_ENV === 'production')
+    out = path.resolve(cwd, 'dist');
+else
+    out = path.resolve(cwd, 'out');
 
 if (fs.existsSync(path.resolve(cwd, 'src/main.py'))) {
-    let out;
-    if (process.env.NODE_ENV == 'production')
-        out = path.resolve(cwd, 'dist');
-    else
-        out = path.resolve(cwd, 'out');
-
     const resolved = path.resolve(cwd, 'src');
 
     const zip = new AdmZip();
@@ -43,211 +42,193 @@ if (fs.existsSync(path.resolve(cwd, 'src/main.py'))) {
     if (fs.existsSync(zipfs))
         zip.addLocalFolder(zipfs, 'fs');
     zip.writeZip(path.join(out, 'plugin.zip'));
+    return;
 }
-else if (false) {
-    const packageJson = JSON.parse(fs.readFileSync(path.join(cwd, 'package.json').toString()));
-    const optionalDependencies = Object.keys(packageJson.optionalDependencies || {});
 
-    let out;
-    if (process.env.NODE_ENV == 'production')
-        out = path.resolve(cwd, 'dist');
-    else
-        out = path.resolve(cwd, 'out');
+const packageJson = JSON.parse(fs.readFileSync(path.join(cwd, 'package.json').toString()));
 
-    let outfile = path.join(out, 'main.nodejs.js');
+const optionalDependencies = Object.keys(packageJson.optionalDependencies || {});
 
-    esbuild.build({
-        entryPoints: ['src/main.ts'],
-        bundle: true,
-        outfile,
-        platform: 'node',
-        format: 'cjs',
-        // loader: { '.json': 'file' },
-        external: [
-            ...Object.keys(optionalDependencies),
-        ],
-        sourcemap: true,
-    })
-        .then(() => {
-            const zip = new AdmZip();
+if (packageJson.scrypted.babel) {
+    process.env.SCRYPTED_WEBPACK_BABEL = 'true';
+}
 
-            const readme = path.join(cwd, 'README.md');
-            if (fs.existsSync(readme)) {
-                zip.addLocalFile(readme);
-            }
-
-            zip.addLocalFile(outfile);
-            zip.addLocalFile(outfile + '.map');
-
-            const zipfs = path.join(cwd, 'fs');
-            if (fs.existsSync(zipfs))
-                zip.addLocalFolder(zipfs, 'fs');
-            zip.writeZip(path.join(out, 'plugin.zip'));
-        })
-        .catch(e => process.nextTick(() => {
-            console.error(e);
-            throw new Error(e);
-        }));
+const defaultMainNodeJs = 'main.nodejs.js';
+const entries = [];
+if (packageJson.exports) {
+    for (const [key, value] of Object.entries(packageJson.exports)) {
+        entries.push({
+            filename: key,
+            output: value,
+        });
+    }
 }
 else {
-    var entry;
-    for (var search of ['src/main.js', 'src/main.ts']) {
-        var resolved = path.resolve(cwd, search);
+    for (const search of ['src/main.js', 'src/main.ts']) {
+        const resolved = path.resolve(cwd, search);
         if (fs.existsSync(resolved)) {
-            entry = resolved;
+            entries.push({
+                filename: search,
+                output: defaultMainNodeJs,
+            });
             break;
         }
     }
+}
 
-    const packageJson = JSON.parse(fs.readFileSync(path.join(cwd, 'package.json').toString()));
-    const optionalDependencies = Object.keys(packageJson.optionalDependencies || {});
+const nodeWebpackConfig = 'webpack.nodejs.config.js';
 
-    if (packageJson.scrypted.babel) {
-        process.env.SCRYPTED_WEBPACK_BABEL = 'true';
+if (!entries?.length) {
+    console.warn('unable to locate src/main.js or src/main.ts');
+    console.warn('if a custom webpack config is used, will fall back to an entry configured there');
+    entries.push(undefined);
+}
+
+const zip = new AdmZip();
+
+const readme = path.join(cwd, 'README.md');
+if (fs.existsSync(readme)) {
+    let readmeText = fs.readFileSync(readme).toString();;
+    const changelog = path.join(cwd, 'CHANGELOG.md');
+    if (fs.existsSync(changelog)) {
+        readmeText += '\n\n\n<br/><br/>' + fs.readFileSync(changelog).toString();
     }
+    zip.addFile('README.md', Buffer.from(readmeText));
+}
 
-    const runtimes = [
-        // {
-        //     config: 'webpack.duktape.config.js',
-        //     output: 'main.js',
-        // },
-        // {
-        //     config: 'webpack.quickjs.config.js',
-        //     output: 'main.quickjs.js',
-        // },
-        {
-            config: 'webpack.nodejs.config.js',
-            output: 'main.nodejs.js',
-        },
-    ];
+const NODE_PATH = path.resolve(__dirname, '..', 'node_modules');
 
-    var out;
-    if (process.env.NODE_ENV == 'production')
-        out = path.resolve(cwd, 'dist');
-    else
-        out = path.resolve(cwd, 'out');
+// hack to override NODE_PATH dynamically.
+// otherwise webpack plugins are not found.
+process.env.NODE_PATH = NODE_PATH;
+require('module').Module._initPaths();
 
-    if (!entry) {
-        console.warn('unable to locate src/main.js or src/main.ts');
-        console.warn('if a custom webpack config is used, will fall back to an entry configured there');
-    }
+async function rollup() {
+    if (out)
+        rimraf.sync(out);
 
-    var webpackCmd = path.resolve(cwd, 'node_modules/.bin/webpack-cli');
-    if (!fs.existsSync(webpackCmd)) {
-        webpackCmd = path.resolve(cwd, 'node_modules/@scrypted/sdk/node_modules/.bin/webpack-cli')
+    let rollupCmd = path.resolve(cwd, 'node_modules/.bin/rollup');
+
+    if (!fs.existsSync(rollupCmd)) {
+        rollupCmd = path.resolve(cwd, 'node_modules/@scrypted/sdk/node_modules/.bin/rollup')
     }
     if (os.platform().startsWith('win')) {
-        webpackCmd += '.cmd';
+        rollupCmd += '.cmd';
     }
-    var zip = new AdmZip();
 
-    const readme = path.join(cwd, 'README.md');
-    if (fs.existsSync(readme)) {
-        let readmeText = fs.readFileSync(readme).toString();;
-        const changelog = path.join(cwd, 'CHANGELOG.md');
-        if (fs.existsSync(changelog)) {
-            readmeText += '\n\n\n<br/><br/>' + fs.readFileSync(changelog).toString();
+    const cp = child_process.spawn(rollupCmd, [
+        '--config', path.resolve(__dirname, '../rollup.nodejs.config.mjs'),
+    ], {
+        stdio: 'inherit',
+    });
+
+    await once(cp, 'exit');
+    if (cp.exitCode)
+        throw new Error('rollup failed');
+
+    finishZip();
+}
+
+async function pack() {
+    if (out)
+        rimraf.sync(out);
+
+    await new Promise((resolve, reject) => {
+        let webpackConfig;
+        const customWebpackConfig = path.resolve(cwd, nodeWebpackConfig);
+        const defaultWebpackConfig = path.resolve(__dirname, '..', nodeWebpackConfig);
+        if (fs.existsSync(customWebpackConfig)) {
+            webpackConfig = customWebpackConfig;
         }
-        zip.addFile('README.md', Buffer.from(readmeText));
-    }
+        else {
+            webpackConfig = defaultWebpackConfig;
+        }
 
-    const NODE_PATH = path.resolve(__dirname, '..', 'node_modules');
+        process.env.SCRYPTED_DEFAULT_WEBPACK_CONFIG = defaultWebpackConfig;
 
-    // hack to override NODE_PATH dynamically.
-    // otherwise webpack plugins are not found.
-    process.env.NODE_PATH = NODE_PATH;
-    require('module').Module._initPaths();
+        const webpackEntries = {};
+        const config = require(webpackConfig);
+        for (let entry of entries) {
+            entry ||= {
+                filename: config?.entry?.main,
+                output: defaultMainNodeJs,
+            };
 
-    async function pack() {
-        if (out)
-            rimraf.sync(out);
+            if (!entry?.filename) {
+                console.error("no main.ts or main.js was found, and webpack config does not supply an entry file.");
+                console.error(entry?.filename);
+                throw new Error();
+            }
 
-        for (const runtime of runtimes) {
-            await new Promise((resolve, reject) => {
-                var webpackConfig;
-                var customWebpackConfig = path.resolve(cwd, runtime.config);
-                const defaultWebpackConfig = path.resolve(__dirname, '..', runtime.config);
-                if (fs.existsSync(customWebpackConfig)) {
-                    webpackConfig = customWebpackConfig;
-                }
-                else {
-                    webpackConfig = defaultWebpackConfig;
-                }
-
-                process.env.SCRYPTED_DEFAULT_WEBPACK_CONFIG = defaultWebpackConfig;
-
-                const config = require(webpackConfig);
-                if (entry) {
-                    // a standard entrypoint was found
-                    config.entry = {
-                        main: entry,
-                    };
-                } else {
-                    // try to use an entrypoint specified in the webpack config
-                    if (!config?.entry?.main) {
-                        console.error("webpack config does not supply an entry file");
-                        return 1;
-                    }
-                    var resolved = path.resolve(cwd, config.entry.main);
-                    if (fs.existsSync(resolved)) {
-                        config.entry.main = resolved
-                    } else {
-                        console.error("entry file specified in webpack config does not exist");
-                        return 1;
-                    }
-                }
-                config.output.path = out;
-                config.output.filename = runtime.output;
+            const main = path.resolve(cwd, entry.filename);
+            if (!fs.existsSync(main)) {
+                console.error("entry file specified in webpack config does not exist");
+                throw new Error();
+            }
 
 
-                for (const opt of optionalDependencies) {
-                    const t = tmp.tmpNameSync({
-                        postfix: '.js',
-                    });
-                    fs.writeFileSync(t, `
+            webpackEntries[entry?.output] = main;
+        }
+
+
+        config.entry = webpackEntries;
+        config.output.filename = '[name]';
+        config.output.path = out;
+        for (const opt of optionalDependencies) {
+            const t = tmp.tmpNameSync({
+                postfix: '.js',
+            });
+            fs.writeFileSync(t, `
                         const e = __non_webpack_require__('${opt}');
                         module.exports = e;
                     `);
-                    config.resolve.alias[opt] = t;
-                }
-
-                webpack(config, (err, stats) => {
-                    if (err)
-                        return reject(err);
-
-                    if (stats.hasErrors()) {
-                        console.error(stats.toJson().errors);
-                        return reject(new Error('webpack failed'));
-                    }
-
-                    // create a zip that has a main.js in the root, and an fs folder containing a read only virtual file system.
-                    // todo: read write file system? seems like a potential sandbox and backup nightmare to do a real fs. scripts should
-                    // use localStorage, etc?
-                    const jsFiles = fs.readdirSync(out, {
-                        withFileTypes: true
-                    }).filter(ft => ft.isFile() && ft.name.endsWith('.js')).map(ft => ft.name);
-                    for (const js of jsFiles) {
-                        zip.addLocalFile(path.join(out, js));
-                        const sourcemap = path.join(out, js + '.map');
-                        if (fs.existsSync(sourcemap))
-                            zip.addLocalFile(sourcemap);
-                        console.log(js);
-                    }
-                    resolve();
-                })
-            });
+            config.resolve.alias[opt] = t;
         }
 
-        var zipfs = path.join(cwd, 'fs');
-        if (fs.existsSync(zipfs))
-            zip.addLocalFolder(zipfs, 'fs');
-        zip.writeZip(path.join(out, 'plugin.zip'));
+        webpack(config, (err, stats) => {
+            if (err)
+                return reject(err);
+
+            if (stats.hasErrors()) {
+                console.error(stats.toJson().errors);
+                return reject(new Error('webpack failed'));
+            }
+
+            resolve();
+        })
+    });
+
+    finishZip();
+}
+
+function finishZip() {
+    // create a zip that has a main.nodejs.js in the root, and an fs folder containing a read only virtual file system.
+    // todo: read write file system? seems like a potential sandbox and backup nightmare to do a real fs. scripts should
+    // use localStorage, etc?
+    const jsFiles = fs.readdirSync(out, {
+        withFileTypes: true
+    }).filter(ft => ft.isFile() && ft.name.endsWith('.js')).map(ft => ft.name);
+    for (const js of jsFiles) {
+        zip.addLocalFile(path.join(out, js));
+        const sourcemap = path.join(out, js + '.map');
+        if (fs.existsSync(sourcemap))
+            zip.addLocalFile(sourcemap);
+        console.log(js);
     }
 
-    pack()
-        .catch(e => process.nextTick(() => {
-            console.error(e);
-            throw new Error(e);
-        }));
+    const sdkVersion = require(path.join(__dirname, '../package.json')).version;
+    zip.addFile('sdk.json', Buffer.from(JSON.stringify({
+        version: sdkVersion,
+    })));
 
+    const zipfs = path.join(cwd, 'fs');
+    if (fs.existsSync(zipfs))
+        zip.addLocalFolder(zipfs, 'fs');
+    zip.writeZip(path.join(out, 'plugin.zip'));
 }
+
+(packageJson.scrypted.rollup ? rollup : pack)()
+    .catch(e => process.nextTick(() => {
+        console.error(e);
+        throw new Error(e);
+    }));

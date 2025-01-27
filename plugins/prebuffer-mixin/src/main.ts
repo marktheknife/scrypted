@@ -1,30 +1,28 @@
-import path from 'path'
 import { AutoenableMixinProvider } from '@scrypted/common/src/autoenable-mixin-provider';
-import { getDebugModeH264EncoderArgs, getH264EncoderArgs } from '@scrypted/common/src/ffmpeg-hardware-acceleration';
 import { addVideoFilterArguments } from '@scrypted/common/src/ffmpeg-helpers';
-import { ParserOptions, ParserSession, handleRebroadcasterClient, startParserSession } from '@scrypted/common/src/ffmpeg-rebroadcast';
 import { ListenZeroSingleClientTimeoutError, closeQuiet, listenZeroSingleClient } from '@scrypted/common/src/listen-cluster';
 import { readLength } from '@scrypted/common/src/read-stream';
-import { H264_NAL_TYPE_FU_B, H264_NAL_TYPE_IDR, H264_NAL_TYPE_MTAP16, H264_NAL_TYPE_MTAP32, H264_NAL_TYPE_RESERVED0, H264_NAL_TYPE_RESERVED30, H264_NAL_TYPE_RESERVED31, H264_NAL_TYPE_SEI, H264_NAL_TYPE_STAP_B, RtspServer, RtspTrack, createRtspParser, findH264NaluType, getNaluTypes, listenSingleRtspClient } from '@scrypted/common/src/rtsp-server';
-import { addTrackControls, parseSdp } from '@scrypted/common/src/sdp-utils';
+import { H264_NAL_TYPE_FU_B, H264_NAL_TYPE_IDR, H264_NAL_TYPE_MTAP16, H264_NAL_TYPE_MTAP32, H264_NAL_TYPE_RESERVED0, H264_NAL_TYPE_RESERVED30, H264_NAL_TYPE_RESERVED31, H264_NAL_TYPE_SEI, H264_NAL_TYPE_SPS, H264_NAL_TYPE_STAP_B, RtspServer, RtspTrack, createRtspParser, findH264NaluType, getNaluTypes, listenSingleRtspClient } from '@scrypted/common/src/rtsp-server';
+import { addTrackControls, getSpsPps, parseSdp } from '@scrypted/common/src/sdp-utils';
 import { SettingsMixinDeviceBase, SettingsMixinDeviceOptions } from "@scrypted/common/src/settings-mixin";
 import { sleep } from '@scrypted/common/src/sleep';
 import { StreamChunk, StreamParser } from '@scrypted/common/src/stream-parser';
-import sdk, { BufferConverter, ChargeState, DeviceProvider, DeviceState, EventListenerRegister, FFmpegInput, H264Info, MediaObject, MediaStreamDestination, MediaStreamOptions, MixinProvider, RequestMediaStreamOptions, ResponseMediaStreamOptions, ScryptedDevice, ScryptedDeviceType, ScryptedInterface, ScryptedMimeTypes, Setting, SettingValue, Settings, VideoCamera, VideoCameraConfiguration } from '@scrypted/sdk';
+import sdk, { BufferConverter, ChargeState, EventListenerRegister, FFmpegInput, ForkWorker, H264Info, MediaObject, MediaStreamDestination, MediaStreamOptions, MixinProvider, RequestMediaStreamOptions, ResponseMediaStreamOptions, ScryptedDevice, ScryptedDeviceType, ScryptedInterface, ScryptedMimeTypes, Setting, SettingValue, Settings, VideoCamera, VideoCameraConfiguration, WritableDeviceState } from '@scrypted/sdk';
 import { StorageSettings } from '@scrypted/sdk/storage-settings';
 import crypto from 'crypto';
 import { once } from 'events';
+import { parse as h264SpsParse } from "h264-sps-parser";
 import net, { AddressInfo } from 'net';
-import semver from 'semver';
+import path from 'path';
 import { Duplex } from 'stream';
-import { Worker } from 'worker_threads';
+import { ParserOptions, ParserSession, startParserSession } from './ffmpeg-rebroadcast';
 import { FileRtspServer } from './file-rtsp-server';
 import { getUrlLocalAdresses } from './local-addresses';
 import { REBROADCAST_MIXIN_INTERFACE_TOKEN } from './rebroadcast-mixin-token';
 import { connectRFC4571Parser, startRFC4571Parser } from './rfc4571';
 import { RtspSessionParserSpecific, startRtspSession } from './rtsp-session';
+import { getSpsResolution } from './sps-resolution';
 import { createStreamSettings } from './stream-settings';
-import { TRANSCODE_MIXIN_PROVIDER_NATIVE_ID, TranscodeMixinProvider, getTranscodeMixinProviderId } from './transcode-settings';
 
 const { mediaManager, log, systemManager, deviceManager } = sdk;
 
@@ -41,13 +39,6 @@ interface PrebufferStreamChunk extends StreamChunk {
   time?: number;
 }
 
-type Prebuffers<T extends string> = {
-  [key in T]: PrebufferStreamChunk[];
-}
-
-type PrebufferParsers = 'rtsp';
-const PrebufferParserValues: PrebufferParsers[] = ['rtsp'];
-
 function hasOddities(h264Info: H264Info) {
   const h264Oddities = h264Info.fuab
     || h264Info.mtap16
@@ -60,13 +51,13 @@ function hasOddities(h264Info: H264Info) {
   return h264Oddities;
 }
 
+type PrebufferParsers = 'rtsp';
+
 class PrebufferSession {
 
   parserSessionPromise: Promise<ParserSession<PrebufferParsers>>;
   parserSession: ParserSession<PrebufferParsers>;
-  prebuffers: Prebuffers<PrebufferParsers> = {
-    rtsp: [],
-  };
+  rtspPrebuffer: PrebufferStreamChunk[] = []
   parsers: { [container: string]: StreamParser };
   sdp: Promise<string>;
   usingScryptedParser = false;
@@ -80,7 +71,7 @@ class PrebufferSession {
 
   activeClients = 0;
   inactivityTimeout: NodeJS.Timeout;
-  audioConfigurationKey: string;
+  syntheticInputIdKey: string;
   ffmpegInputArgumentsKey: string;
   ffmpegOutputArgumentsKey: string;
   lastDetectedAudioCodecKey: string;
@@ -96,7 +87,7 @@ class PrebufferSession {
     this.storage = mixin.storage;
     this.console = mixin.console;
     this.mixinDevice = mixin.mixinDevice;
-    this.audioConfigurationKey = 'audioConfiguration-' + this.streamId;
+    this.syntheticInputIdKey = 'syntheticInputIdKey-' + this.streamId;
     this.ffmpegInputArgumentsKey = 'ffmpegInputArguments-' + this.streamId;
     this.ffmpegOutputArgumentsKey = 'ffmpegOutputArguments-' + this.streamId;
     this.lastDetectedAudioCodecKey = 'lastDetectedAudioCodec-' + this.streamId;
@@ -124,10 +115,6 @@ class PrebufferSession {
     return !this.enabled || this.shouldDisableBatteryPrebuffer();
   }
 
-  get canPrebuffer() {
-    return (this.advertisedMediaStreamOptions.container !== 'rawvideo' && this.advertisedMediaStreamOptions.container !== 'ffmpeg') || this.storage.getItem(this.ffmpegOutputArgumentsKey);
-  }
-
   getLastH264Probe(): H264Info {
     const str = this.storage.getItem(this.lastH264ProbeKey);
     if (!str) {
@@ -148,10 +135,10 @@ class PrebufferSession {
 
   getDetectedIdrInterval() {
     const durations: number[] = [];
-    if (this.prebuffers.rtsp.length) {
+    if (this.rtspPrebuffer.length) {
       let last: number;
 
-      for (const chunk of this.prebuffers.rtsp) {
+      for (const chunk of this.rtspPrebuffer) {
         if (findH264NaluType(chunk, H264_NAL_TYPE_IDR)) {
           if (last)
             durations.push(chunk.time - last);
@@ -176,9 +163,7 @@ class PrebufferSession {
   }
 
   clearPrebuffers() {
-    for (const prebuffer of PrebufferParserValues) {
-      this.prebuffers[prebuffer] = [];
-    }
+    this.rtspPrebuffer = [];
   }
 
   release() {
@@ -203,13 +188,33 @@ class PrebufferSession {
       return;
     this.console.log(this.streamName, 'prebuffer session started');
     this.parserSessionPromise = this.startPrebufferSession();
-    this.parserSessionPromise.then(pso => pso.killed.finally(() => {
-      this.console.error(this.streamName, 'prebuffer session ended');
-      this.parserSessionPromise = undefined;
-    }))
+    let active = false;
+    this.parserSessionPromise.then(pso => {
+      pso.once('rtsp', () => {
+        active = true;
+        if (!this.mixin.online)
+          this.mixin.online = true;
+      });
+
+      pso.killed.finally(() => {
+        this.console.error(this.streamName, 'prebuffer session ended');
+        this.parserSessionPromise = undefined;
+      });
+    })
       .catch(e => {
         this.console.error(this.streamName, 'prebuffer session ended with error', e);
         this.parserSessionPromise = undefined;
+
+        if (!active) {
+          // find sessions that arent this one, and check their prebuffers to see if any data has been received.
+          // if there's no data, then consider this camera offline.
+          const others = [...this.mixin.sessions.values()].filter(s => s !== this);
+          if (others.length) {
+            const hasData = others.some(s => s.rtspPrebuffer.length);
+            if (!hasData && this.mixin.online)
+              this.mixin.online = false;
+          }
+        }
       });
   }
 
@@ -219,12 +224,20 @@ class PrebufferSession {
 
   getParser(mediaStreamOptions: MediaStreamOptions) {
     let parser: string;
-    const rtspParser = this.storage.getItem(this.rtspParserKey);
+    let rtspParser = this.storage.getItem(this.rtspParserKey);
+
+    let isDefault = !rtspParser || rtspParser === 'Default';
 
     if (!this.canUseRtspParser(mediaStreamOptions)) {
       parser = STRING_DEFAULT;
+      isDefault = true;
+      rtspParser = undefined;
     }
     else {
+      if (isDefault) {
+        // use the plugin default
+        rtspParser = localStorage.getItem('defaultRtspParser');
+      }
       switch (rtspParser) {
         case FFMPEG_PARSER_TCP:
         case FFMPEG_PARSER_UDP:
@@ -240,7 +253,59 @@ class PrebufferSession {
 
     return {
       parser,
-      isDefault: !rtspParser || rtspParser === 'Default',
+      isDefault,
+    }
+  }
+
+  async parseCodecs(skipResolution?: boolean) {
+    const sdp = await this.parserSession.sdp;
+    const parsedSdp = parseSdp(sdp);
+    const videoSection = parsedSdp.msections.find(msection => msection.type === 'video');
+    const audioSection = parsedSdp.msections.find(msection => msection.type === 'audio');
+
+    const inputAudioCodec = audioSection?.codec;
+    const inputVideoCodec = videoSection.codec;
+    let inputVideoResolution: ReturnType<typeof getSpsResolution>;
+
+    if (!skipResolution) {
+      // scan the prebuffer for sps
+      for (const chunk of this.rtspPrebuffer) {
+        try {
+          let sps = findH264NaluType(chunk, H264_NAL_TYPE_SPS);
+          if (sps) {
+            const parsedSps = h264SpsParse(sps);
+            inputVideoResolution = getSpsResolution(parsedSps);
+          }
+          else if (!sps) {
+            // sps = findH265NaluType(chunk, H265_NAL_TYPE_SPS);
+          }
+        }
+        catch (e) {
+        }
+      }
+
+      if (!inputVideoResolution) {
+        try {
+          const spspps = getSpsPps(videoSection);
+          let { sps } = spspps;
+          if (sps) {
+            if (videoSection.codec === 'h264') {
+              const parsedSps = h264SpsParse(sps);
+              inputVideoResolution = getSpsResolution(parsedSps);
+            }
+            else if (videoSection.codec === 'h265') {
+            }
+          }
+        }
+        catch (e) {
+        }
+      }
+    }
+
+    return {
+      inputVideoCodec,
+      inputAudioCodec,
+      inputVideoResolution,
     }
   }
 
@@ -251,7 +316,7 @@ class PrebufferSession {
 
     let total = 0;
     let start = 0;
-    for (const prebuffer of this.prebuffers.rtsp) {
+    for (const prebuffer of this.rtspPrebuffer) {
       start = start || prebuffer.time;
       for (const chunk of prebuffer.chunks) {
         total += chunk.byteLength;
@@ -262,6 +327,19 @@ class PrebufferSession {
 
     const group = "Streams";
     const subgroup = `Stream: ${this.streamName}`;
+
+    if (this.mixin.streamSettings.storageSettings.values.synthenticStreams.includes(this.streamId)) {
+      const nonSynthetic = [...this.mixin.sessions.keys()].filter(s => s && !s.startsWith('synthetic:'));
+      settings.push({
+        group,
+        subgroup,
+        key: this.syntheticInputIdKey,
+        title: 'Synthetic Stream Source',
+        description: 'The source stream to transcode.',
+        choices: nonSynthetic,
+        value: this.storage.getItem(this.syntheticInputIdKey),
+      });
+    }
 
     const addFFmpegInputSettings = () => {
       settings.push(
@@ -281,14 +359,14 @@ class PrebufferSession {
           combobox: true,
         },
         {
-          title: 'FFmpeg Output Arguments Prefix',
+          title: 'FFmpeg Output Prefix',
           group,
           subgroup,
-          description: 'Optional/Advanced: Additional output arguments to pass to the ffmpeg command. These will be placed before the input arguments.',
+          description: 'Optional/Advanced: Additional output arguments to pass to the ffmpeg command. These will be placed before the output.',
           key: this.ffmpegOutputArgumentsKey,
           value: this.storage.getItem(this.ffmpegOutputArgumentsKey),
           choices: [
-            '-c:v libx264 -pix_fmt yuvj420p -preset ultrafast -bf 0'
+            '-c:v libx264 -pix_fmt yuvj420p -preset ultrafast -bf 0 -g 60 -r 15 -b:v 500000 -bufsize 1000000 -maxrate 500000'
           ],
           combobox: true,
         },
@@ -300,11 +378,6 @@ class PrebufferSession {
     if (this.canUseRtspParser(this.advertisedMediaStreamOptions)) {
       const parser = this.getParser(this.advertisedMediaStreamOptions);
       const defaultValue = parser.parser;
-
-      const scryptedOptions = [
-        SCRYPTED_PARSER_TCP,
-        SCRYPTED_PARSER_UDP,
-      ];
 
       const currentParser = parser.isDefault ? STRING_DEFAULT : parser.parser;
 
@@ -318,7 +391,8 @@ class PrebufferSession {
           value: currentParser,
           choices: [
             STRING_DEFAULT,
-            ...scryptedOptions,
+            SCRYPTED_PARSER_TCP,
+            SCRYPTED_PARSER_UDP,
             FFMPEG_PARSER_TCP,
             FFMPEG_PARSER_UDP,
           ],
@@ -347,8 +421,9 @@ class PrebufferSession {
     };
 
     if (session) {
-      const resolution = session.inputVideoResolution?.width && session.inputVideoResolution?.height
-        ? `${session.inputVideoResolution?.width}x${session.inputVideoResolution?.height}`
+      const codecInfo = await this.parseCodecs();
+      const resolution = codecInfo.inputVideoResolution?.width && codecInfo.inputVideoResolution?.height
+        ? `${codecInfo.inputVideoResolution?.width}x${codecInfo.inputVideoResolution?.height}`
         : 'unknown';
 
       const idrInterval = this.getDetectedIdrInterval();
@@ -368,7 +443,7 @@ class PrebufferSession {
           subgroup,
           title: 'Detected Video/Audio Codecs',
           readonly: true,
-          value: (session?.inputVideoCodec?.toString() || 'unknown') + '/' + (session?.inputAudioCodec?.toString() || 'unknown'),
+          value: (codecInfo?.inputVideoCodec?.toString() || 'unknown') + '/' + (codecInfo?.inputAudioCodec?.toString() || 'unknown'),
           description: 'Configuring your camera to H264 video, and audio to Opus or PCM-mulaw (G.711ulaw) is recommended.'
         },
         {
@@ -426,6 +501,8 @@ class PrebufferSession {
     let mso: ResponseMediaStreamOptions;
     try {
       mso = (await this.mixinDevice.getVideoStreamOptions()).find(o => o.id === this.streamId);
+      if (this.mixin.streamSettings.storageSettings.values.noAudio)
+        mso.audio = null;
     }
     catch (e) {
     }
@@ -452,7 +529,19 @@ class PrebufferSession {
     };
     this.parsers = rbo.parsers;
 
-    const mo = await this.mixinDevice.getVideoStream(mso);
+    let mo: MediaObject;
+    if (this.mixin.streamSettings.storageSettings.values.synthenticStreams.includes(this.streamId)) {
+      const syntheticInputId = this.storage.getItem(this.syntheticInputIdKey);
+      if (!syntheticInputId)
+        throw new Error('synthetic stream has not been configured with an input');
+      const realDevice = systemManager.getDeviceById<VideoCamera>(this.mixin.id);
+      mo = await realDevice.getVideoStream({
+        id: syntheticInputId,
+      });
+    }
+    else {
+      mo = await this.mixinDevice.getVideoStream(mso);
+    }
     const isRfc4571 = mo.mimeType === 'x-scrypted/x-rfc4571';
 
     let session: ParserSession<PrebufferParsers>;
@@ -479,11 +568,9 @@ class PrebufferSession {
       session = startRFC4571Parser(this.console, connectRFC4571Parser(url), sdp, mediaStreamOptions, {
         timeout: 10000,
       });
-      this.sdp = session.sdp.then(buffers => Buffer.concat(buffers).toString());
     }
     else {
-      const moBuffer = await mediaManager.convertMediaObjectToBuffer(mo, ScryptedMimeTypes.FFmpegInput);
-      const ffmpegInput = JSON.parse(moBuffer.toString()) as FFmpegInput;
+      const ffmpegInput: FFmpegInput = await mediaManager.convertMediaObjectToJSON(mo, ScryptedMimeTypes.FFmpegInput);
       sessionMso = ffmpegInput.mediaStreamOptions || this.advertisedMediaStreamOptions;
 
       let { parser, isDefault } = this.getParser(sessionMso);
@@ -510,7 +597,6 @@ class PrebufferSession {
           audioSoftMuted,
           rtspRequestTimeout: 10000,
         });
-        this.sdp = session.sdp.then(buffers => Buffer.concat(buffers).toString());
       }
       else {
         let acodec: string[];
@@ -546,6 +632,9 @@ class PrebufferSession {
         // if (!userInputArguments && (ffmpegInput.container === 'rtmp' || ffmpegInput.url?.startsWith('rtmp:')))
         //   ffmpegInput.inputArguments.unshift('-use_wallclock_as_timestamps', '1');
 
+        if (ffmpegInput.h264EncoderArguments?.length) {
+          vcodec = [...ffmpegInput.h264EncoderArguments];
+        }
         // extraOutputArguments must contain full codec information
         if (extraOutputArguments) {
           vcodec = [...extraOutputArguments.split(' ').filter(d => !!d)];
@@ -558,12 +647,17 @@ class PrebufferSession {
           // the rtsp parser should always stream copy unless audio is soft muted.
           acodec,
         });
-        this.sdp = rtspParser.sdp;
         rbo.parsers.rtsp = rtspParser;
 
         session = await startParserSession(ffmpegInput, rbo);
       }
     }
+
+    this.sdp = session.sdp;
+    session.on('error', e => {
+      if (!e.message?.startsWith('killed:'))
+        console.error('rebroadcast error', e)
+    });
 
     if (this.usingScryptedParser && !isRfc4571) {
       // watch the stream for 10 seconds to see if an weird nalu is encountered.
@@ -624,37 +718,38 @@ class PrebufferSession {
     }
 
     await session.sdp;
-
-    // complain to the user about the codec if necessary. upstream may send a audio
-    // stream but report none exists (to request muting).
-    if (!audioSoftMuted && advertisedAudioCodec && session.inputAudioCodec !== undefined
-      && session.inputAudioCodec !== advertisedAudioCodec) {
-      this.console.warn('Audio codec plugin reported vs detected mismatch', advertisedAudioCodec, detectedAudioCodec);
-    }
-
-    const advertisedVideoCodec = mso?.video?.codec;
-    if (advertisedVideoCodec && session.inputVideoCodec !== undefined
-      && session.inputVideoCodec !== advertisedVideoCodec) {
-      this.console.warn('Video codec plugin reported vs detected mismatch', advertisedVideoCodec, session.inputVideoCodec);
-    }
-
-    if (!session.inputAudioCodec) {
-      this.console.log('No audio stream detected.');
-    }
-
-    // set/update the detected codec, set it to null if no audio was found.
-    this.storage.setItem(this.lastDetectedAudioCodecKey, session.inputAudioCodec || 'null');
-
-    if (session.inputVideoCodec !== 'h264') {
-      this.console.error(`Video codec is not h264. If there are errors, try changing your camera's encoder output.`);
-    }
-
     this.parserSession = session;
     session.killed.finally(() => {
       if (this.parserSession === session)
         this.parserSession = undefined;
     });
     session.killed.finally(() => clearTimeout(this.inactivityTimeout));
+
+    const codecInfo = await this.parseCodecs();
+
+    // complain to the user about the codec if necessary. upstream may send a audio
+    // stream but report none exists (to request muting).
+    if (!audioSoftMuted && advertisedAudioCodec && codecInfo.inputAudioCodec !== undefined
+      && codecInfo.inputAudioCodec !== advertisedAudioCodec) {
+      this.console.warn('Audio codec plugin reported vs detected mismatch', advertisedAudioCodec, detectedAudioCodec);
+    }
+
+    const advertisedVideoCodec = mso?.video?.codec;
+    if (advertisedVideoCodec && codecInfo.inputVideoCodec !== undefined
+      && codecInfo.inputVideoCodec !== advertisedVideoCodec) {
+      this.console.warn('Video codec plugin reported vs detected mismatch', advertisedVideoCodec, codecInfo.inputVideoCodec);
+    }
+
+    if (!codecInfo.inputAudioCodec) {
+      this.console.log('No audio stream detected.');
+    }
+
+    // set/update the detected codec, set it to null if no audio was found.
+    this.storage.setItem(this.lastDetectedAudioCodecKey, codecInfo.inputAudioCodec || 'null');
+
+    if (codecInfo.inputVideoCodec !== 'h264') {
+      this.console.error(`Video codec is not h264. If there are errors, try changing your camera's encoder output.`);
+    }
 
     // settings ui refresh
     deviceManager.onMixinEvent(this.mixin.id, this.mixin, ScryptedInterface.Settings, undefined);
@@ -668,8 +763,7 @@ class PrebufferSession {
         if (!session.isActive)
           return;
         const mo = await this.mixinDevice.getVideoStream(mso);
-        const moBuffer = await mediaManager.convertMediaObjectToBuffer(mo, ScryptedMimeTypes.FFmpegInput);
-        const ffmpegInput = JSON.parse(moBuffer.toString()) as FFmpegInput;
+        const ffmpegInput: FFmpegInput = await mediaManager.convertMediaObjectToJSON(mo, ScryptedMimeTypes.FFmpegInput);
         mso = ffmpegInput.mediaStreamOptions;
 
         scheduleRefresh(mso);
@@ -685,28 +779,26 @@ class PrebufferSession {
       session.killed.finally(() => clearTimeout(refreshTimeout));
     }
 
-    for (const container of PrebufferParserValues) {
-      let shifts = 0;
-      let prebufferContainer: PrebufferStreamChunk[] = this.prebuffers[container];
+    let shifts = 0;
+    let prebufferContainer: PrebufferStreamChunk[] = this.rtspPrebuffer;
 
-      session.on(container, (chunk: PrebufferStreamChunk) => {
-        const now = Date.now();
+    session.on('rtsp', (chunk: PrebufferStreamChunk) => {
+      const now = Date.now();
 
-        chunk.time = now;
-        prebufferContainer.push(chunk);
+      chunk.time = now;
+      prebufferContainer.push(chunk);
 
-        while (prebufferContainer.length && prebufferContainer[0].time < now - prebufferDurationMs) {
-          prebufferContainer.shift();
-          shifts++;
-        }
+      while (prebufferContainer.length && prebufferContainer[0].time < now - prebufferDurationMs) {
+        prebufferContainer.shift();
+        shifts++;
+      }
 
-        if (shifts > 100000) {
-          prebufferContainer = prebufferContainer.slice();
-          this.prebuffers[container] = prebufferContainer;
-          shifts = 0;
-        }
-      });
-    }
+      if (shifts > 100000) {
+        prebufferContainer = prebufferContainer.slice();
+        this.rtspPrebuffer = prebufferContainer;
+        shifts = 0;
+      }
+    });
 
     session.start();
     return session;
@@ -736,7 +828,7 @@ class PrebufferSession {
         return;
       }
       this.console.log(this.streamName, 'terminating rebroadcast due to inactivity');
-      session.kill(new Error('stream inactivity'));
+      session.kill(new Error('killed: stream inactivity'));
     }, 10000);
   }
 
@@ -752,7 +844,7 @@ class PrebufferSession {
         if (!this.activeClients && this.parserSessionPromise) {
           this.console.log(this.streamName, 'terminating rebroadcast due to low battery or not charging')
           const session = await this.parserSessionPromise;
-          session.kill(new Error('low battery or not charging'));
+          session.kill(new Error('killed: low battery or not charging'));
         }
       } else {
         this.ensurePrebufferSession();
@@ -783,19 +875,24 @@ class PrebufferSession {
   async handleRebroadcasterClient(options: {
     findSyncFrame: boolean,
     isActiveClient: boolean,
-    container: PrebufferParsers,
     session: ParserSession<PrebufferParsers>,
     socketPromise: Promise<Duplex>,
     requestedPrebuffer: number,
     filter?: (chunk: StreamChunk, prebuffer: boolean) => StreamChunk,
   }) {
-    const { isActiveClient, container, session, socketPromise, requestedPrebuffer } = options;
-    this.console.log('sending prebuffer', requestedPrebuffer);
+    const { isActiveClient, session, socketPromise, requestedPrebuffer } = options;
+    // this.console.log('sending prebuffer', requestedPrebuffer);
 
     let socket: Duplex;
 
     try {
       socket = await socketPromise;
+
+      if (!session.isActive) {
+        // session may be killed while waiting for socket.
+        socket.destroy();
+        throw new Error('session terminated before socket connected');
+      }
     }
     catch (e) {
       // in case the client never connects, do an inactivity check.
@@ -820,70 +917,81 @@ class PrebufferSession {
       this.inactivityCheck(session, isActiveClient);
     });
 
-    handleRebroadcasterClient(socket, {
-      // console: this.console,
-      connect: (connection) => {
-        const now = Date.now();
-
-        const safeWriteData = (chunk: StreamChunk, prebuffer?: boolean) => {
-          if (options.filter) {
-            chunk = options.filter(chunk, prebuffer);
-            if (!chunk)
-              return;
-          }
-          const buffered = connection.writeData(chunk);
-          if (buffered > 100000000) {
-            this.console.log('more than 100MB has been buffered, did downstream die? killing connection.', this.streamName);
-            cleanup();
-          }
-        }
-
-        const cleanup = () => {
-          session.removeListener(container, safeWriteData);
-          session.removeListener('killed', cleanup);
-          connection.destroy();
-        }
-
-        session.on(container, safeWriteData);
-        session.once('killed', cleanup);
-
-        const prebufferContainer: PrebufferStreamChunk[] = this.prebuffers[container];
-        // if the requested container or the source container is not rtsp, use an exact seek.
-        // this works better when the requested container is mp4, and rtsp is the source.
-        // if starting on a sync frame, ffmpeg will skip the first segment while initializing
-        // on live sources like rtsp. the buffer before the sync frame stream will be enough
-        // for ffmpeg to analyze and start up in time for the sync frame.
-        // may be worth considering playing with a few other things to avoid this:
-        // mpeg-ts as a container (would need to write a muxer)
-        // specifying the buffer before the sync frame with probesize.
-        // If h264 oddities are detected, assume ffmpeg will be used.
-        if (container !== 'rtsp' || !options.findSyncFrame || this.getLastH264Oddities()) {
-          for (const chunk of prebufferContainer) {
-            if (chunk.time < now - requestedPrebuffer)
-              continue;
-
-            safeWriteData(chunk, true);
-          }
-        }
-        else {
-          const parser = this.parsers[container];
-          const filtered = prebufferContainer.filter(pb => pb.time >= now - requestedPrebuffer);
-          let availablePrebuffers = parser.findSyncFrame(filtered);
-          if (!availablePrebuffers) {
-            this.console.warn('Unable to find sync frame in rtsp prebuffer.');
-            availablePrebuffers = [];
-          }
-          else {
-            this.console.log('Found sync frame in rtsp prebuffer.');
-          }
-          for (const prebuffer of availablePrebuffers) {
-            safeWriteData(prebuffer, true);
-          }
-        }
-
-        return cleanup;
+    let writeData = (data: StreamChunk): number => {
+      if (data.startStream) {
+        socket.write(data.startStream)
       }
-    })
+
+      const writeDataWithoutStartStream = (data: StreamChunk) => {
+        for (const chunk of data.chunks) {
+          socket.write(chunk);
+        }
+
+        return socket.writableLength;
+      };
+
+      writeData = writeDataWithoutStartStream;
+      return writeDataWithoutStartStream(data);
+    }
+
+    const safeWriteData = (chunk: StreamChunk, prebuffer?: boolean) => {
+      if (options.filter) {
+        chunk = options.filter(chunk, prebuffer);
+        if (!chunk)
+          return;
+      }
+      const buffered = writeData(chunk);
+      if (buffered > 100000000) {
+        this.console.log('more than 100MB has been buffered, did downstream die? killing connection.', this.streamName);
+        cleanup();
+      }
+    }
+
+    const cleanup = () => {
+      socket.destroy();
+      session.removeListener('rtsp', safeWriteData);
+      session.removeListener('killed', cleanup);
+    };
+
+    session.on('rtsp', safeWriteData);
+    session.once('killed', cleanup);
+
+    socket.once('close', () => {
+      cleanup();
+    });
+
+    // socket.on('error', e => this.console.log('client stream ended'));
+
+
+    const now = Date.now();
+    const prebufferContainer: PrebufferStreamChunk[] = this.rtspPrebuffer;
+    // if starting on a sync frame, ffmpeg will skip the first segment while initializing
+    // on live sources like rtsp. the buffer before the sync frame stream will be enough
+    // for ffmpeg to analyze and start up in time for the sync frame.
+    // If h264 oddities are detected, assume ffmpeg will be used.
+    if (!options.findSyncFrame || this.getLastH264Oddities()) {
+      for (const chunk of prebufferContainer) {
+        if (chunk.time < now - requestedPrebuffer)
+          continue;
+
+        safeWriteData(chunk, true);
+      }
+    }
+    else {
+      const parser = this.parsers['rtsp'];
+      const filtered = prebufferContainer.filter(pb => pb.time >= now - requestedPrebuffer);
+      let availablePrebuffers = parser.findSyncFrame(filtered);
+      if (!availablePrebuffers) {
+        this.console.warn('Unable to find sync frame in rtsp prebuffer.');
+        availablePrebuffers = [];
+      }
+      else {
+        // this.console.log('Found sync frame in rtsp prebuffer.');
+      }
+      for (const prebuffer of availablePrebuffers) {
+        safeWriteData(prebuffer, true);
+      }
+    }
   }
 
   async getVideoStream(findSyncFrame: boolean, options?: RequestMediaStreamOptions) {
@@ -908,7 +1016,8 @@ class PrebufferSession {
       requestedPrebuffer = Math.min(defaultPrebuffer, this.getDetectedIdrInterval() || defaultPrebuffer);;
     }
 
-    const mediaStreamOptions: ResponseMediaStreamOptions = session.negotiateMediaStream(options);
+    const codecInfo = await this.parseCodecs(true);
+    const mediaStreamOptions: ResponseMediaStreamOptions = session.negotiateMediaStream(options, codecInfo.inputVideoCodec, codecInfo.inputAudioCodec);
     let sdp = await this.sdp;
     if (!mediaStreamOptions.video?.h264Info && this.usingScryptedParser) {
       mediaStreamOptions.video ||= {};
@@ -1010,8 +1119,6 @@ class PrebufferSession {
       urls = await getUrlLocalAdresses(this.console, url);
     }
 
-    const container = 'rtsp';
-
     mediaStreamOptions.sdp = sdp;
 
     const isActiveClient = options?.refresh !== false;
@@ -1019,7 +1126,6 @@ class PrebufferSession {
     this.handleRebroadcasterClient({
       findSyncFrame,
       isActiveClient,
-      container,
       requestedPrebuffer,
       socketPromise,
       session,
@@ -1037,15 +1143,15 @@ class PrebufferSession {
       mediaStreamOptions.audio.sampleRate ||= audioSection.rtpmap.clock;
     }
 
-    if (session.inputVideoResolution?.width && session.inputVideoResolution?.height) {
+    if (codecInfo.inputVideoResolution?.width && codecInfo.inputVideoResolution?.height) {
       // this may be an audio only request.
       if (mediaStreamOptions.video)
-        Object.assign(mediaStreamOptions.video, session.inputVideoResolution);
+        Object.assign(mediaStreamOptions.video, codecInfo.inputVideoResolution);
     }
 
     const now = Date.now();
     let available = 0;
-    const prebufferContainer: PrebufferStreamChunk[] = this.prebuffers[container];
+    const prebufferContainer: PrebufferStreamChunk[] = this.rtspPrebuffer;
     for (const prebuffer of prebufferContainer) {
       if (prebuffer.time < now - requestedPrebuffer)
         continue;
@@ -1066,11 +1172,11 @@ class PrebufferSession {
     const ffmpegInput: FFmpegInput = {
       url,
       urls,
-      container,
+      container: 'rtsp',
       inputArguments: [
         ...inputArguments,
-        ...(this.parsers[container].inputArguments || []),
-        '-f', this.parsers[container].container,
+        ...(this.parsers['rtsp'].inputArguments || []),
+        '-f', this.parsers['rtsp'].container,
         '-i', url,
       ],
       mediaStreamOptions,
@@ -1165,7 +1271,6 @@ class PrebufferMixin extends SettingsMixinDeviceBase<VideoCamera> implements Vid
         prebufferSession.handleRebroadcasterClient({
           findSyncFrame: true,
           isActiveClient: true,
-          container: 'rtsp',
           session,
           socketPromise: Promise.resolve(client),
           requestedPrebuffer,
@@ -1200,9 +1305,6 @@ class PrebufferMixin extends SettingsMixinDeviceBase<VideoCamera> implements Vid
   }
 
   async getVideoStream(options?: RequestMediaStreamOptions): Promise<MediaObject> {
-    if (options?.route === 'direct')
-      return this.mixinDevice.getVideoStream(options);
-
     await this.ensurePrebufferSessions();
 
     let id = options?.id;
@@ -1211,8 +1313,6 @@ class PrebufferMixin extends SettingsMixinDeviceBase<VideoCamera> implements Vid
     let h264EncoderArguments: string[];
     let videoFilterArguments: string;
     let destinationVideoBitrate: number;
-
-    const transcodingEnabled = this.mixins?.includes(getTranscodeMixinProviderId());
 
     const msos = await this.mixinDevice.getVideoStreamOptions();
     let result: {
@@ -1273,58 +1373,23 @@ class PrebufferMixin extends SettingsMixinDeviceBase<VideoCamera> implements Vid
       }
 
       id = result.stream.id;
-      this.console.log('Selected stream', result.stream.name);
-      // transcoding video should never happen transparently since it is CPU intensive.
-      // encourage users at every step to configure proper codecs.
-      // for this reason, do not automatically supply h264 encoder arguments
-      // even if h264 is requested, to force a visible failure.
-      if (transcodingEnabled && this.streamSettings.storageSettings.values.transcodeStreams?.includes(result.title)) {
-        h264EncoderArguments = transcodeStorageSettings.h264EncoderArguments?.split(' ');
-        if (this.streamSettings.storageSettings.values.videoFilterArguments)
-          videoFilterArguments = this.streamSettings.storageSettings.values.videoFilterArguments;
-      }
     }
 
     let session = this.sessions.get(id);
     let ffmpegInput: FFmpegInput;
-    if (!session.canPrebuffer) {
-      this.console.log('Source container can not be prebuffered. Using a direct media stream.');
-      session = undefined;
-    }
-    if (!session) {
-      const mo = await this.mixinDevice.getVideoStream(options);
-      if (!transcodingEnabled)
-        return mo;
-      ffmpegInput = await mediaManager.convertMediaObjectToJSON(mo, ScryptedMimeTypes.FFmpegInput);
-    }
-    else {
-      // ffmpeg probing works better if the stream does NOT start on a sync frame. the pre-sps/pps data is used
-      // as part of the stream analysis, and sync frame is immediately used. otherwise the sync frame is
-      // read and tossed during rtsp analysis.
-      // if ffmpeg is not in used (ie, not transcoding or implicitly rtsp),
-      // trust that downstream is not using ffmpeg and start with a sync frame.
-      const findSyncFrame = !transcodingEnabled
-        && (!options?.container || options?.container === 'rtsp')
-        && options?.tool !== 'ffmpeg';
-      ffmpegInput = await session.getVideoStream(findSyncFrame, options);
-    }
+    if (!session)
+      throw new Error('stream not found');
+
+    ffmpegInput = await session.getVideoStream(true, options);
 
     ffmpegInput.h264EncoderArguments = h264EncoderArguments;
     ffmpegInput.destinationVideoBitrate = destinationVideoBitrate;
-
-    if (transcodingEnabled && this.streamSettings.storageSettings.values.missingCodecParameters) {
-      if (!ffmpegInput.mediaStreamOptions)
-        ffmpegInput.mediaStreamOptions = { id };
-      ffmpegInput.mediaStreamOptions.oobCodecParameters = true;
-    }
 
     if (ffmpegInput.h264FilterArguments && videoFilterArguments)
       addVideoFilterArguments(ffmpegInput.h264FilterArguments, videoFilterArguments)
     else if (videoFilterArguments)
       ffmpegInput.h264FilterArguments = ['-filter_complex', videoFilterArguments];
 
-    if (transcodingEnabled)
-      ffmpegInput.videoDecoderArguments = this.streamSettings.storageSettings.values.videoDecoderArguments?.split(' ');
     return mediaManager.createFFmpegMediaObject(ffmpegInput, {
       sourceId: this.id,
     });
@@ -1343,11 +1408,13 @@ class PrebufferMixin extends SettingsMixinDeviceBase<VideoCamera> implements Vid
         log.a(`${this.name} is a cloud camera. Prebuffering maintains a persistent stream and will not be enabled by default. You must enable the Prebuffer stream manually.`)
       }
     }
-
-    if (!enabledIds.length)
-      this.online = true;
-
-    let active = 0;
+    if (this.storage.getItem('warnedSynthetic') !== 'true') {
+      const synthetic = msos?.find(mso => mso.source === 'synthetic');
+      if (synthetic) {
+        this.storage.setItem('warnedSynthetic', 'true');
+        log.a(`${this.name} is a synthetic stream requiring substantial transcoding overhead. Prebuffering maintains a persistent stream and will not be enabled by default. You must enable the Prebuffer stream manually.`)
+      }
+    }
 
     // figure out the default stream and streams that may have been removed due to
     // a config change.
@@ -1391,28 +1458,34 @@ class PrebufferMixin extends SettingsMixinDeviceBase<VideoCamera> implements Vid
           }
 
           session.ensurePrebufferSession();
-          let wasActive = false;
           try {
             this.console.log(name, 'prebuffer session starting');
             const ps = await session.parserSessionPromise;
-            active++;
-            wasActive = true;
-            this.online = !!active;
             await ps.killed;
           }
           catch (e) {
-          }
-          finally {
-            if (wasActive)
-              active--;
-            wasActive = false;
-            this.online = !!active;
           }
           this.console.log(this.name, 'restarting prebuffer session in 5 seconds');
           await new Promise(resolve => setTimeout(resolve, 5000));
         }
         this.console.log(name, 'exiting prebuffer session (released or restarted with new configuration)');
       })();
+    }
+
+    for (const synthetic of this.streamSettings.storageSettings.values.synthenticStreams) {
+      const id = `synthetic:${synthetic}`;
+      toRemove.delete(id);
+
+      let session = this.sessions.get(id);
+
+      if (session)
+        continue;
+
+      session = new PrebufferSession(this, {
+        id: synthetic,
+      }, false, false);
+      this.sessions.set(id, session);
+      this.console.log('stream', synthetic, 'is synthetic and will be rebroadcast on demand.');
     }
 
     if (!this.sessions.has(undefined)) {
@@ -1543,38 +1616,49 @@ function millisUntilMidnight() {
   return (midnight.getTime() - new Date().getTime());
 }
 
-export class RebroadcastPlugin extends AutoenableMixinProvider implements MixinProvider, BufferConverter, Settings, DeviceProvider {
+export class RebroadcastPlugin extends AutoenableMixinProvider implements MixinProvider, BufferConverter, Settings, Settings {
   // no longer in use, but kept for future use.
-  storageSettings = new StorageSettings(this, {});
+  storageSettings = new StorageSettings(this, {
+    defaultRtspParser: {
+      group: 'Advanced',
+      title: 'Default RTSP Parser',
+      description: `Experimental: The Default parser used to read RTSP streams. The default is "${SCRYPTED_PARSER_TCP}".`,
+      defaultValue: STRING_DEFAULT,
+      choices: [
+        STRING_DEFAULT,
+        SCRYPTED_PARSER_TCP,
+        SCRYPTED_PARSER_UDP,
+        FFMPEG_PARSER_TCP,
+        FFMPEG_PARSER_UDP,
+      ],
+      onPut: () => {
+        this.log.a('Rebroadcast Plugin will restart momentarily.');
+        sdk.deviceManager.requestRestart();
+      }
+    }
+  });
+
   transcodeStorageSettings = new StorageSettings(this, {
     remoteStreamingBitrate: {
+      group: 'Advanced',
       title: 'Remote Streaming Bitrate',
       type: 'number',
-      defaultValue: 1000000,
+      defaultValue: 500000,
       description: 'The bitrate to use when remote streaming. This setting will only be used when transcoding or adaptive bitrate is enabled on a camera.',
       onPut() {
         sdk.deviceManager.onDeviceEvent('transcode', ScryptedInterface.Settings, undefined);
       },
     },
-    h264EncoderArguments: {
-      title: 'H264 Encoder Arguments',
-      description: 'FFmpeg arguments used to encode h264 video. This is not camera specific and is used to setup the hardware accelerated encoder on your Scrypted server. This setting will only be used when transcoding is enabled on a camera.',
-      choices: Object.keys(getH264EncoderArgs()),
-      defaultValue: getDebugModeH264EncoderArgs().join(' '),
-      combobox: true,
-      mapPut: (oldValue, newValue) => getH264EncoderArgs()[newValue]?.join(' ') || newValue || getDebugModeH264EncoderArgs().join(' '),
-      onPut() {
-        sdk.deviceManager.onDeviceEvent('transcode', ScryptedInterface.Settings, undefined);
-      },
-    }
   });
   currentMixins = new Map<PrebufferMixin, {
-    worker: Worker,
+    worker: ForkWorker,
     id: string,
   }>();
 
   constructor(nativeId?: string) {
     super(nativeId);
+
+    this.log.clearAlerts();
 
     this.fromMimeType = 'x-scrypted/x-rfc4571';
     this.toMimeType = ScryptedMimeTypes.FFmpegInput;
@@ -1595,39 +1679,24 @@ export class RebroadcastPlugin extends AutoenableMixinProvider implements MixinP
       }
     });
 
-    // schedule restarts at 2am
-    const midnight = millisUntilMidnight();
-    const twoAM = midnight + 2 * 60 * 60 * 1000;
-    this.log.i(`Rebroadcaster scheduled for restart at 2AM: ${Math.round(twoAM / 1000 / 60)} minutes`)
-    setTimeout(() => deviceManager.requestRestart(), twoAM);
-
-    process.nextTick(() => {
-      deviceManager.onDeviceDiscovered({
-        nativeId: TRANSCODE_MIXIN_PROVIDER_NATIVE_ID,
-        name: 'Transcoding',
-        interfaces: [
-          "SystemSettings",
-          ScryptedInterface.Settings,
-          ScryptedInterface.MixinProvider,
-        ],
-        type: ScryptedDeviceType.API,
+    // legacy transcode extension that needs to be removed.
+    if (sdk.deviceManager.getNativeIds().includes('transcode')) {
+      process.nextTick(() => {
+        deviceManager.onDeviceRemoved('transcode');
       });
-    });
+    }
   }
 
-  async releaseDevice(id: string, nativeId: string): Promise<void> {
-  }
-
-  async getDevice(nativeId: string) {
-    if (nativeId === TRANSCODE_MIXIN_PROVIDER_NATIVE_ID)
-      return new TranscodeMixinProvider(this);
-  }
-
-  getSettings(): Promise<Setting[]> {
-    return this.storageSettings.getSettings();
+  async getSettings(): Promise<Setting[]> {
+    return [
+      ...await this.storageSettings.getSettings(),
+      ...await this.transcodeStorageSettings.getSettings(),
+    ];
   }
 
   putSetting(key: string, value: SettingValue): Promise<void> {
+    if (this.transcodeStorageSettings.keys[key])
+      return this.transcodeStorageSettings.putSetting(key, value);
     return this.storageSettings.putSetting(key, value);
   }
 
@@ -1647,7 +1716,7 @@ export class RebroadcastPlugin extends AutoenableMixinProvider implements MixinP
     const u = new URL(url);
     if (!u.protocol.startsWith('tcp'))
       throw new Error('rfc4751 url must be tcp');
-    const { clientPromise, url: clientUrl } = await listenZeroSingleClient();
+    const { clientPromise, url: clientUrl } = await listenZeroSingleClient('127.0.0.1');
     const ffmpeg: FFmpegInput = {
       url: clientUrl,
       inputArguments: [
@@ -1700,48 +1769,19 @@ export class RebroadcastPlugin extends AutoenableMixinProvider implements MixinP
     return ret;
   }
 
-  async getMixin(mixinDevice: any, mixinDeviceInterfaces: ScryptedInterface[], mixinDeviceState: DeviceState) {
+  async getMixin(mixinDevice: any, mixinDeviceInterfaces: ScryptedInterface[], mixinDeviceState: WritableDeviceState) {
     this.setHasEnabledMixin(mixinDeviceState.id);
 
-    // 8-11-2022
-    // old scrypted had a bug where mixin device state was not exposing properties like id correctly
-    // across rpc boundaries.
-    let fork = false;
-    try {
-      const info = await systemManager.getComponent('info');
-      const version = await info.getVersion();
-      fork = semver.gte(version, '0.2.5');
-    }
-    catch (e) {
-    }
-
     const { id } = mixinDeviceState;
-
-    if (fork && sdk.fork && typeof mixinDeviceState.id === 'string') {
-      const forked = sdk.fork<RebroadcastPluginFork>();
-      const { worker } = forked;
-
-      try {
-        const result = await forked.result;
-        const mixin = await result.newPrebufferMixin(async () => this.transcodeStorageSettings.values, mixinDevice, mixinDeviceInterfaces, mixinDeviceState);
-        this.currentMixins.set(mixin, {
-          worker,
-          id,
-        });
-        return mixin;
-      }
-      catch (e) {
-        throw e;
-      }
-    }
-    else {
-      const ret = await newPrebufferMixin(async () => this.transcodeStorageSettings.values, mixinDevice, mixinDeviceInterfaces, mixinDeviceState);
-      this.currentMixins.set(ret, {
-        worker: undefined,
-        id,
-      });
-      return ret;
-    }
+    const forked = sdk.fork<RebroadcastPluginFork>();
+    const { worker } = forked;
+    const result = await forked.result;
+    const mixin = await result.newPrebufferMixin(async () => this.transcodeStorageSettings.values, mixinDevice, mixinDeviceInterfaces, mixinDeviceState);
+    this.currentMixins.set(mixin, {
+      worker,
+      id,
+    });
+    return mixin;
   }
 
   async releaseMixin(id: string, mixinDevice: PrebufferMixin) {
@@ -1753,7 +1793,7 @@ export class RebroadcastPlugin extends AutoenableMixinProvider implements MixinP
   }
 }
 
-async function newPrebufferMixin(getTranscodeStorageSettings: () => Promise<any>, mixinDevice: any, mixinDeviceInterfaces: ScryptedInterface[], mixinDeviceState: DeviceState) {
+async function newPrebufferMixin(getTranscodeStorageSettings: () => Promise<any>, mixinDevice: any, mixinDeviceInterfaces: ScryptedInterface[], mixinDeviceState: WritableDeviceState) {
   return new PrebufferMixin(getTranscodeStorageSettings, {
     mixinDevice,
     mixinDeviceState,

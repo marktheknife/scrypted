@@ -2,8 +2,9 @@ import { DeviceManager, ScryptedNativeId, SystemManager } from '@scrypted/types'
 import { Console } from 'console';
 import { once } from 'events';
 import net, { Server } from 'net';
-import { PassThrough, Readable } from 'stream';
+import { PassThrough, Readable, Writable } from 'stream';
 import { listenZero } from '../listen-zero';
+import { isClusterAddress } from '../cluster/cluster-setup';
 
 export interface ConsoleServer {
     pluginConsole: Console;
@@ -76,8 +77,11 @@ export function prepareConsoles(getConsoleName: () => string, systemManager: () 
         ret = getConsole(async (stdout, stderr) => {
             const connect = async () => {
                 const plugins = await getPlugins();
-                const port = await plugins.getRemoteServicePort(getConsoleName(), 'console-writer');
-                const socket = net.connect(port);
+                const [port,host] = await plugins.getRemoteServicePort(getConsoleName(), 'console-writer');
+                const socket = net.connect({
+                    port,
+                    host,
+                });
                 socket.write(nativeId + '\n');
                 const writer = (data: Buffer) => {
                     socket.write(data);
@@ -136,8 +140,12 @@ export function prepareConsoles(getConsoleName: () => string, systemManager: () 
                 if (!mixin)
                     return;
                 const { pluginId, nativeId: mixinNativeId } = mixin;
-                const port = await plugins.getRemoteServicePort(pluginId, 'console-writer');
-                const socket = net.connect(port);
+                const [port, host] = await plugins.getRemoteServicePort(pluginId, 'console-writer');
+                const socket = net.connect({
+                    port,
+                    host,
+                });
+                socket.on('error', () => { });
                 socket.write(mixinNativeId + '\n');
                 const writer = (data: Buffer) => {
                     let str = data.toString().trim();
@@ -295,8 +303,12 @@ export async function createConsoleServer(remoteStdout: Readable, remoteStderr: 
         socket.once('error', cleanup);
         socket.once('end', cleanup);
     });
-    const readPort = await listenZero(readServer);
-    const writePort = await listenZero(writeServer);
+
+    let address = '0.0.0.0';
+    if (isClusterAddress(address))
+        address = '127.0.0.1';
+    const readPort = await listenZero(readServer, address);
+    const writePort = await listenZero(writeServer, address);
 
     return {
         clear(nativeId: ScryptedNativeId) {
@@ -323,4 +335,23 @@ export async function createConsoleServer(remoteStdout: Readable, remoteStderr: 
         readPort,
         writePort,
     };
+}
+
+export function pipeWorkerConsole(nativeWorker: { stdout: Readable, stderr: Readable }, useConsole = console) {
+    nativeWorker.stdout.on('data', (data) => {
+        useConsole.log(data.toString());
+    });
+    nativeWorker.stderr.on('data', (data) => {
+        useConsole.error(data.toString());
+    });
+}
+
+export async function writeWorkerGenerator(asyncIterator: AsyncGenerator<Buffer>, writable: Writable) {
+    try {
+        for await (const data of asyncIterator) {
+            writable.write(data);
+        }
+    }
+    catch (e) {
+    }
 }

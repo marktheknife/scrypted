@@ -1,14 +1,12 @@
-import { ParserSession, setupActivityTimer } from "@scrypted/common/src/ffmpeg-rebroadcast";
-import { closeQuiet, createBindZero } from "@scrypted/common/src/listen-cluster";
-import { findH264NaluType, H264_NAL_TYPE_SPS, parseSemicolonDelimited, RtspClient, RtspClientUdpSetupOptions, RTSP_FRAME_MAGIC } from "@scrypted/common/src/rtsp-server";
+import { closeQuiet } from "@scrypted/common/src/listen-cluster";
+import { RTSP_FRAME_MAGIC, RtspClient, RtspClientUdpSetupOptions, parseSemicolonDelimited } from "@scrypted/common/src/rtsp-server";
 import { parseSdp } from "@scrypted/common/src/sdp-utils";
 import { StreamChunk } from "@scrypted/common/src/stream-parser";
 import { ResponseMediaStreamOptions } from "@scrypted/sdk";
 import dgram from 'dgram';
-import { parse as spsParse } from "h264-sps-parser";
 import { EventEmitter } from "stream";
+import { ParserSession, setupActivityTimer } from "./ffmpeg-rebroadcast";
 import { negotiateMediaStream } from "./rfc4571";
-import { getSpsResolution } from "./sps-resolution";
 
 export type RtspChannelCodecMapping = { [key: number]: string };
 
@@ -24,7 +22,7 @@ export async function startRtspSession(console: Console, url: string, mediaStrea
     let isActive = true;
     const events = new EventEmitter();
     // need this to prevent kill from throwing due to uncaught Error during cleanup
-    events.on('error', e => console.error('rebroadcast error', e));
+    events.on('error', () => {});
 
     let servers: dgram.Socket[] = [];
     const rtspClient = new RtspClient(url);
@@ -65,17 +63,6 @@ export async function startRtspSession(console: Console, url: string, mediaStrea
     try {
         await rtspClient.options();
         const sdpResponse = await rtspClient.describe();
-        const contentBase = sdpResponse.headers['content-base'];
-        if (contentBase) {
-            const url = new URL(contentBase, rtspClient.url);
-            const existing = new URL(rtspClient.url);
-            for (const p of existing.searchParams) {
-                url.searchParams.append(p[0], p[1]);
-            }
-            url.username = existing.username;
-            url.password = existing.password;
-            rtspClient.url = url.toString();
-        }
         let sdp = sdpResponse.body.toString().trim();
         console.log('sdp', sdp);
 
@@ -203,80 +190,22 @@ export async function startRtspSession(console: Console, url: string, mediaStrea
 
         // this return block is intentional, to ensure that the remaining code happens sync.
         return (() => {
-            const audioSection = parsedSdp.msections.find(msection => msection.type === 'audio');
             const videoSection = parsedSdp.msections.find(msection => msection.type === 'video');
 
             if (!videoSection)
                 throw new Error('SDP does not contain a video section!');
 
-            const inputAudioCodec = audioSection?.codec;
-            const inputVideoCodec = videoSection.codec;
-
-
-            let inputVideoResolution: {
-                width: number;
-                height: number;
-            };
-
-            const probeStart = Date.now();
-            const probe = (chunk: StreamChunk) => {
-                if (Date.now() - probeStart > 6000)
-                    events.removeListener('rtsp', probe);
-                const sps = findH264NaluType(chunk, H264_NAL_TYPE_SPS);
-                if (sps) {
-                    try {
-                        const parsedSps = spsParse(sps);
-                        inputVideoResolution = getSpsResolution(parsedSps);
-                        // console.log(inputVideoResolution);
-                        console.log('parsed bitstream sps', inputVideoResolution);
-                    }
-                    catch (e) {
-                        console.warn('sps parsing failed');
-                        inputVideoResolution = {
-                            width: NaN,
-                            height: NaN,
-                        }
-                    }
-                    events.removeListener('rtsp', probe);
-                }
-            }
-
-            if (!inputVideoResolution)
-                events.on('rtsp', probe);
-
-            const sprop = videoSection
-                ?.fmtp?.[0]?.parameters?.['sprop-parameter-sets'];
-            const sdpSps = sprop?.split(',')?.[0];
-            // const sdpPps = sprop?.split(',')?.[1];
-
-            if (sdpSps) {
-                try {
-                    const sps = Buffer.from(sdpSps, 'base64');
-                    const parsedSps = spsParse(sps);
-                    inputVideoResolution = getSpsResolution(parsedSps);
-                    console.log('parsed sdp sps', inputVideoResolution);
-                }
-                catch (e) {
-                    console.warn('sdp sps parsing failed');
-                }
-            }
-
             return {
                 parserSpecific,
                 start,
-                sdp: Promise.resolve([Buffer.from(sdp)]),
-                inputAudioCodec,
-                inputVideoCodec,
-                get inputVideoResolution() {
-                    return inputVideoResolution;
-                },
+                sdp: Promise.resolve(sdp),
                 get isActive() { return isActive },
                 kill(error?: Error) {
                     kill(error);
                 },
                 killed,
                 resetActivityTimer,
-                negotiateMediaStream: (requestMediaStream) => {
+                negotiateMediaStream: (requestMediaStream, inputVideoCodec, inputAudioCodec) => {
                     return negotiateMediaStream(sdp, mediaStreamOptions, inputVideoCodec, inputAudioCodec, requestMediaStream);
                 },
                 emit(container: 'rtsp', chunk: StreamChunk) {

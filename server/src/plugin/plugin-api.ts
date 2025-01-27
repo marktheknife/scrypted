@@ -1,5 +1,5 @@
 import type { Device, DeviceManifest, EventDetails, EventListenerOptions, EventListenerRegister, MediaManager, MediaObject, ScryptedDevice, ScryptedInterfaceDescriptor, ScryptedInterfaceProperty, ScryptedNativeId, SystemDeviceState } from '@scrypted/types';
-import { AccessControls } from './acl';
+import type { AccessControls } from './acl';
 
 export interface PluginLogger {
     log(level: string, message: string): Promise<void>;
@@ -158,23 +158,25 @@ export class PluginAPIProxy extends PluginAPIManagedListeners implements PluginA
 }
 
 export interface PluginRemoteLoadZipOptions {
-    /**
-     * The filename to load the script as. Use for debugger source mapping.
-     */
-    filename?: string;
-    /**
-     * The path that the zip is currently unzipped at on the server. May not
-     * exist on the "remote", if it is not the same machine.
-     */
-    unzippedPath?: string;
+    debug?: boolean;
+    zipHash: string;
     fork?: boolean;
+    main?: string;
 
     clusterId: string;
+    clusterWorkerId: string;
     clusterSecret: string;
 }
 
+export class PluginZipAPI {
+    constructor(
+        public getZip: () => Promise<Buffer>
+    ) {
+    }
+}
+
 export interface PluginRemote {
-    loadZip(packageJson: any, zipData: Buffer | string, options: PluginRemoteLoadZipOptions): Promise<any>;
+    loadZip(packageJson: any, zipAPI: PluginZipAPI, options: PluginRemoteLoadZipOptions): Promise<any>;
     setSystemState(state: { [id: string]: { [property: string]: SystemDeviceState } }): Promise<void>;
     setNativeId(nativeId: ScryptedNativeId, id: string, storage: { [key: string]: any }): Promise<void>;
     updateDeviceState(id: string, state: { [property: string]: SystemDeviceState }): Promise<void>;
@@ -188,7 +190,7 @@ export interface PluginRemote {
 
     createDeviceState(id: string, setState: (property: string, value: any) => Promise<any>): Promise<any>;
 
-    getServicePort(name: string, ...args: any[]): Promise<number>;
+    getServicePort(name: string, ...args: any[]): Promise<[number, string]>;
 }
 
 export interface MediaObjectRemote extends MediaObject {

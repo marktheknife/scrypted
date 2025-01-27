@@ -72,6 +72,7 @@ function removescryptedfstab() {
     grep -v "scrypted-nvr" /etc/fstab > /tmp/fstab && cp /tmp/fstab /etc/fstab
     # ensure newline
     sed -i -e '$a\' /etc/fstab
+    systemctl daemon-reload
 }
 
 BLOCK_DEVICE="/dev/$1"
@@ -95,7 +96,17 @@ then
     set +e
 
     sync
-    mkfs -F -t ext4 "$BLOCK_DEVICE"1
+    PARTITION_DEVICE="$BLOCK_DEVICE"1
+    if [ ! -e "$PARTITION_DEVICE" ]
+    then
+        PARTITION_DEVICE="$BLOCK_DEVICE"p1
+        if [ ! -e "$PARTITION_DEVICE" ]
+        then
+            echo "Unable to determine block device partition from block device: $BLOCK_DEVICE"
+            exit 1
+        fi
+    fi
+    mkfs -F -t ext4 "$PARTITION_DEVICE"
     sync
 
     # parse/evaluate blkid line as env vars
@@ -117,8 +128,9 @@ then
     set -e
     removescryptedfstab
     mkdir -p /mnt/scrypted-nvr
-    echo "PARTLABEL=scrypted-nvr     /mnt/scrypted-nvr    ext4   defaults,nofail 0 0" >> /etc/fstab
+    echo "UUID=$UUID     /mnt/scrypted-nvr    ext4   defaults,nofail,noatime,x-systemd.automount 0 0" >> /etc/fstab
     mount -a
+    systemctl daemon-reload
     set +e
 
     DIR="/mnt/scrypted-nvr"

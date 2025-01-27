@@ -1,6 +1,6 @@
 import crypto from 'crypto';
 import { createScriptDevice, ScriptDeviceImpl, tsCompile } from '@scrypted/common/src/eval/scrypted-eval';
-import sdk, { DeviceCreator, DeviceCreatorSettings, DeviceProvider, EventListenerRegister, MixinProvider, Scriptable, ScriptSource, ScryptedDevice, ScryptedDeviceBase, ScryptedDeviceType, ScryptedInterface, ScryptedInterfaceDescriptors, Setting, Settings } from '@scrypted/sdk';
+import sdk, { DeviceCreator, DeviceCreatorSettings, DeviceProvider, EventListenerRegister, MixinProvider, Scriptable, ScriptSource, ScryptedDevice, ScryptedDeviceBase, ScryptedDeviceType, ScryptedInterface, ScryptedInterfaceDescriptors, Setting, Settings, WritableDeviceState } from '@scrypted/sdk';
 import { StorageSettings } from "@scrypted/sdk/storage-settings"
 import aedes, { AedesOptions } from 'aedes';
 import fs from 'fs';
@@ -294,13 +294,15 @@ class MqttPublisherMixin extends SettingsMixinDeviceBase<any> {
             allProperties.push(...properties);
         }
 
+        let found: ReturnType<typeof publishAutoDiscovery>;
+
         client.on('connect', packet => {
             this.console.log('MQTT client connected, publishing current state.');
             for (const method of allMethods) {
                 client.subscribe(this.pathname + '/' + method);
             }
 
-            publishAutoDiscovery(this.provider.storageSettings.values.mqttId, client, this, this.pathname, 'homeassistant');
+            found = publishAutoDiscovery(this.provider.storageSettings.values.mqttId, client, this, this.pathname, true, 'homeassistant');
             client.subscribe('homeassistant/status');
             this.publishState(client);
         });
@@ -311,14 +313,17 @@ class MqttPublisherMixin extends SettingsMixinDeviceBase<any> {
 
         client.on('message', async (messageTopic, message) => {
             if (messageTopic === 'homeassistant/status') {
-                publishAutoDiscovery(this.provider.storageSettings.values.mqttId, client, this, this.pathname, 'homeassistant');
+                publishAutoDiscovery(this.provider.storageSettings.values.mqttId, client, this, this.pathname, false, 'homeassistant');
                 this.publishState(client);
                 return;
             }
             const method = messageTopic.substring(this.pathname.length + 1);
             if (!allMethods.includes(method)) {
-                if (!allProperties.includes(method))
-                    this.console.warn('unknown topic', method);
+                if (!allProperties.includes(method)) {
+                    if (!found?.has(method)) {
+                        this.console.warn('unknown topic', method);
+                    }
+                }
                 return;
             }
             try {
@@ -357,6 +362,10 @@ export class MqttProvider extends ScryptedDeviceBase implements DeviceProvider, 
     constructor(nativeId?: string) {
         super(nativeId);
 
+        this.systemDevice = {
+            deviceCreator: 'MQTT Device',
+        };
+
         this.maybeEnableBroker();
 
         for (const deviceId of deviceManager.getNativeIds()) {
@@ -386,7 +395,8 @@ export class MqttProvider extends ScryptedDeviceBase implements DeviceProvider, 
     }
 
     async createDevice(settings: DeviceCreatorSettings): Promise<string> {
-        const { name, template } = settings;
+        let { name, template } = settings;
+        name = name || 'New MQTT Device';
         if (!template || template === MQTT_AUTODISCOVERY)
             return this.newAutoDiscovery(name.toString());
 
@@ -592,7 +602,7 @@ export class MqttProvider extends ScryptedDeviceBase implements DeviceProvider, 
         return isPublishable(type, interfaces) ? [ScryptedInterface.Settings] : undefined;
     }
 
-    async getMixin(mixinDevice: any, mixinDeviceInterfaces: ScryptedInterface[], mixinDeviceState: { [key: string]: any; }): Promise<any> {
+    async getMixin(mixinDevice: any, mixinDeviceInterfaces: ScryptedInterface[], mixinDeviceState: WritableDeviceState): Promise<any> {
         return new MqttPublisherMixin(this, {
             mixinDevice,
             mixinDeviceState,

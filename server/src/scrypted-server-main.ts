@@ -7,43 +7,30 @@ import fs from 'fs';
 import http from 'http';
 import httpAuth from 'http-auth';
 import https from 'https';
-import ip, { isV4Format } from 'ip';
 import net from 'net';
 import os from 'os';
 import path from 'path';
 import process from 'process';
-import semver from 'semver';
 import { install as installSourceMapSupport } from 'source-map-support';
 import { createSelfSignedCertificate, CURRENT_SELF_SIGNED_CERTIFICATE_VERSION } from './cert';
+import { getScryptedClusterMode } from './cluster/cluster-setup';
 import { Plugin, ScryptedUser, Settings } from './db-types';
+import { getUsableNetworkAddresses } from './ip';
 import Level from './level';
-import { PluginError } from './plugin/plugin-error';
 import { getScryptedVolume } from './plugin/plugin-volume';
-import { RPCResultError } from './rpc';
 import { ScryptedRuntime } from './runtime';
-import { getHostAddresses, SCRYPTED_DEBUG_PORT, SCRYPTED_INSECURE_PORT, SCRYPTED_SECURE_PORT } from './server-settings';
+import { createClusterServer } from './scrypted-cluster-main';
+import { SCRYPTED_DEBUG_PORT, SCRYPTED_INSECURE_PORT, SCRYPTED_SECURE_PORT } from './server-settings';
 import { getNpmPackageInfo } from './services/plugin';
+import type { ServiceControl } from './services/service-control';
 import { setScryptedUserPassword, UsersService } from './services/users';
 import { sleep } from './sleep';
 import { ONE_DAY_MILLISECONDS, UserToken } from './usertoken';
-import AdmZip from 'adm-zip';
 
 export type Runtime = ScryptedRuntime;
 
-if (!semver.gte(process.version, '18.0.0')) {
-    throw new Error('"node" version out of date. Please update node to v18 or higher.')
-}
-
-process.on('unhandledRejection', error => {
-    if (error?.constructor !== RPCResultError && error?.constructor !== PluginError) {
-        console.error('pending crash', error);
-        throw error;
-    }
-    console.warn('unhandled rejection of RPC Result', error);
-});
-
-async function listenServerPort(env: string, port: number, server: any) {
-    server.listen(port);
+async function listenServerPort(env: string, port: number, server: http.Server | https.Server | net.Server, hostname?: string) {
+    server.listen(port, hostname);
     try {
         await once(server, 'listening');
     }
@@ -59,10 +46,11 @@ installSourceMapSupport({
 });
 
 let workerInspectPort: number = undefined;
+let workerInspectAddress: string = undefined;
 
 async function doconnect(): Promise<net.Socket> {
     return new Promise((resolve, reject) => {
-        const target = net.connect(workerInspectPort, '127.0.0.1');
+        const target = net.connect(workerInspectPort, workerInspectAddress);
         target.once('error', reject)
         target.once('connect', () => resolve(target))
     })
@@ -109,11 +97,13 @@ app.use(bodyParser.urlencoded({ extended: false }) as any)
 app.use(bodyParser.json())
 
 // parse some custom thing into a Buffer
-app.use(bodyParser.raw({ type: 'application/zip', limit: 100000000 }) as any)
+app.use(bodyParser.raw({ type: 'application/*', limit: 100000000 }) as any)
 
 async function start(mainFilename: string, options?: {
     onRuntimeCreated?: (runtime: ScryptedRuntime) => Promise<void>,
+    serviceControl?: ServiceControl;
 }) {
+    console.log('Scrypted server starting.');
     const volumeDir = getScryptedVolume();
     await fs.promises.mkdir(volumeDir, {
         recursive: true
@@ -161,6 +151,16 @@ async function start(mainFilename: string, options?: {
 
         callback(sha === user.passwordHash || password === user.token);
     });
+
+    // the default http-auth will returns a WWW-Authenticate header if login fails.
+    // this causes the Safari to prompt for login.
+    // https://github.com/gevorg/http-auth/blob/4158fa75f58de70fd44aa68876a8674725e0556e/src/auth/base.js#L81
+    // override the ask function to return a bare 401 instead.
+    // @ts-expect-error
+    basicAuth.ask = (res) => {
+        res.statusCode = 401;
+        res.end();
+    };
 
     const httpsServerOptions = process.env.SCRYPTED_HTTPS_OPTIONS_FILE
         ? JSON.parse(fs.readFileSync(process.env.SCRYPTED_HTTPS_OPTIONS_FILE).toString())
@@ -311,12 +311,26 @@ async function start(mainFilename: string, options?: {
         next();
     });
 
-    // allow basic auth to deploy plugins
+    // all methods under /web/component require admin auth.
     app.all('/web/component/*', (req, res, next) => {
+        // check if the user is admin authed already, and if not, continue on with basic auth to escalate.
+        // this will cover anonymous access like in demo site.
+        if (res.locals.username && !res.locals.aclId) {
+            next();
+            return;
+        }
+
         if (req.protocol === 'https' && req.headers.authorization && req.headers.authorization.toLowerCase()?.indexOf('basic') !== -1) {
-            const basicChecker = basicAuth.check((req) => {
-                res.locals.username = req.user;
-                (req as any).username = req.user;
+            const basicChecker = basicAuth.check(async (req) => {
+                try {
+                    const user = await db.tryGet(ScryptedUser, req.user);
+                    res.locals.username = user._id;
+                    res.locals.aclId = user.aclId;
+                }
+                catch (e) {
+                    // should be unreachable.
+                    console.warn('basic auth failed unexpectedly', e);
+                }
                 next();
             });
 
@@ -325,7 +339,7 @@ async function start(mainFilename: string, options?: {
             return;
         }
         next();
-    })
+    });
 
     // verify all plugin related requests have admin auth
     app.all('/web/component/*', (req, res, next) => {
@@ -338,7 +352,17 @@ async function start(mainFilename: string, options?: {
     });
 
     const scrypted = new ScryptedRuntime(mainFilename, db, insecure, secure, app);
+    if (options?.serviceControl)
+        scrypted.serviceControl = options.serviceControl;
     await options?.onRuntimeCreated?.(scrypted);
+
+    const clusterMode = getScryptedClusterMode();
+    if (clusterMode?.[0] === 'server') {
+        console.log('Cluster server starting.');
+        const clusterServer = createClusterServer(mainFilename, scrypted, keyPair);
+        await listenServerPort('SCRYPTED_CLUSTER_SERVER', clusterMode[2], clusterServer);
+    }
+
     await scrypted.start();
 
 
@@ -451,12 +475,23 @@ async function start(mainFilename: string, options?: {
             debugServer.on('connection', resolve);
         });
 
+        waitDebug.catch(() => { });
+
         workerInspectPort = Math.round(Math.random() * 10000) + 30000;
+        workerInspectAddress = '127.0.0.1';
         try {
-            await scrypted.installPlugin(plugin, {
+            const host = await scrypted.installPlugin(plugin, {
                 waitDebug,
                 inspectPort: workerInspectPort,
             });
+
+            const clusterWorkerId = await host.clusterWorkerId;
+            if (clusterWorkerId) {
+                const clusterWorker = scrypted.clusterWorkers.get(clusterWorkerId);
+                if (clusterWorker) {
+                    workerInspectAddress = clusterWorker.address;
+                }
+            }
         }
         catch (e) {
             res.header('Content-Type', 'text/plain');
@@ -467,6 +502,7 @@ async function start(mainFilename: string, options?: {
 
         res.send({
             workerInspectPort,
+            workerInspectAddress,
         });
     });
 
@@ -509,9 +545,9 @@ async function start(mainFilename: string, options?: {
     });
 
     const getAlternateAddresses = async () => {
-        const addresses = ((await scrypted.addressSettings.getLocalAddresses()) || getHostAddresses(true, true))
+        const addresses = ((await scrypted.addressSettings.getLocalAddresses()) || getUsableNetworkAddresses())
             .map(address => {
-                if (ip.isV6Format(address) && !isV4Format(address))
+                if (net.isIPv6(address) && !net.isIPv4(address))
                     address = `[${address}]`;
                 return `https://${address}:${SCRYPTED_SECURE_PORT}`
             });
@@ -715,19 +751,19 @@ async function start(mainFilename: string, options?: {
     console.log('#######################################################');
     console.log(`Scrypted Volume           : ${volumeDir}`);
     console.log(`Scrypted Server (Local)   : https://localhost:${SCRYPTED_SECURE_PORT}/`);
-    for (const address of getHostAddresses(true, true)) {
+    for (const address of getUsableNetworkAddresses()) {
         console.log(`Scrypted Server (Remote)  : https://${address}:${SCRYPTED_SECURE_PORT}/`);
     }
     console.log(`Version:       : ${await scrypted.info.getVersion()}`);
     console.log('#######################################################');
     console.log('Scrypted insecure http service port:', SCRYPTED_INSECURE_PORT);
-    console.log('Ports can be changed with environment variables.')
-    console.log('https: $SCRYPTED_SECURE_PORT')
-    console.log('http : $SCRYPTED_INSECURE_PORT')
-    console.log('Certificate can be modified via tls.createSecureContext options in')
+    console.log('Ports can be changed with environment variables.');
+    console.log('https: $SCRYPTED_SECURE_PORT');
+    console.log('http : $SCRYPTED_INSECURE_PORT');
+    console.log('Certificate can be modified via tls.createSecureContext options in');
     console.log('JSON file located at SCRYPTED_HTTPS_OPTIONS_FILE environment variable:');
     console.log('export SCRYPTED_HTTPS_OPTIONS_FILE=/path/to/options.json');
-    console.log('https://nodejs.org/api/tls.html#tlscreatesecurecontextoptions')
+    console.log('https://nodejs.org/api/tls.html#tlscreatesecurecontextoptions');
     console.log('#######################################################');
 
     return scrypted;

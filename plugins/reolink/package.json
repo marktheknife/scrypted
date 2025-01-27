@@ -1,6 +1,6 @@
 {
    "name": "@scrypted/reolink",
-   "version": "0.0.59",
+   "version": "0.0.104",
    "description": "Reolink Plugin for Scrypted",
    "author": "Scrypted",
    "license": "Apache",
@@ -27,6 +27,8 @@
       "name": "Reolink Camera Plugin",
       "type": "DeviceProvider",
       "interfaces": [
+         "ScryptedSystemDevice",
+         "ScryptedDeviceCreator",
          "DeviceProvider",
          "DeviceCreator"
       ],
@@ -40,6 +42,7 @@
       "onvif": "file:../onvif/onvif"
    },
    "devDependencies": {
-      "@types/node": "^18.16.18"
+      "@types/node": "^22.0.2",
+      "@scrypted/sdk": "file:../../sdk"
    }
 }

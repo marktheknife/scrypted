@@ -1,13 +1,14 @@
 import { sleep } from '@scrypted/common/src/sleep';
-import sdk, { Device, DeviceProvider, ScryptedDeviceBase, ScryptedDeviceType, ScryptedInterface, Setting, Settings, SettingValue } from '@scrypted/sdk';
+import sdk, { Device, DeviceProvider, HttpRequest, HttpRequestHandler, HttpResponse, ScryptedDeviceBase, ScryptedDeviceType, ScryptedInterface, Setting, Settings, SettingValue } from '@scrypted/sdk';
 import { StorageSettings } from '@scrypted/sdk/storage-settings';
 import crypto from 'crypto';
 import { RingLocationDevice } from './location';
 import { Location, RingBaseApi, RingRestClient } from './ring-client-api';
+import { RingCameraDevice } from './camera';
 
 const { deviceManager, mediaManager } = sdk;
 
-class RingPlugin extends ScryptedDeviceBase implements DeviceProvider, Settings {
+class RingPlugin extends ScryptedDeviceBase implements DeviceProvider, Settings, HttpRequestHandler {
     loginClient: RingRestClient;
     api: RingBaseApi;
     devices = new Map<string, RingLocationDevice>();
@@ -68,12 +69,6 @@ class RingPlugin extends ScryptedDeviceBase implements DeviceProvider, Settings 
             description: 'Optional: If supplied will on show this locationID.',
             hide: true,
         },
-        cameraDingsPollingSeconds: {
-            title: 'Poll Interval',
-            type: 'number',
-            description: 'Optional: Change the default polling interval for motion and doorbell events.',
-            defaultValue: 5,
-        },
         nightModeBypassAlarmState: {
             title: 'Night Mode Bypass Alarm State',
             description: 'Set this to enable the "Night" option on the alarm panel. When arming in "Night" mode, all open sensors will be bypassed and the alarm will be armed to the selected option.',
@@ -95,14 +90,45 @@ class RingPlugin extends ScryptedDeviceBase implements DeviceProvider, Settings 
     constructor() {
         super();
 
-        this.settingsStorage.settings.cameraDingsPollingSeconds.onGet = async () => {
-            return {
-                hide: !this.settingsStorage.values.polling,
-            };
-        }
-
         this.discoverDevices()
             .catch(e => this.console.error('discovery failure', e));
+    }
+
+    async onRequest(request: HttpRequest, response: HttpResponse) {
+        if (request.isPublicEndpoint) {
+            response.send('', {
+                code: 401,
+            });
+            return;
+        }
+
+        let normalizedUrl = request.url.substring(request.rootPath.length);
+        if (normalizedUrl.startsWith('/thumbnail')) {
+            const [, , id, ding_id] = normalizedUrl.split('/');
+            const locationId = sdk.systemManager.getDeviceById(id).providerId;
+            const locationNativeId = sdk.systemManager.getDeviceById(locationId).nativeId;
+            const location = this.devices.get(locationNativeId);
+            const camera = location.devices.get(sdk.systemManager.getDeviceById(id).nativeId) as RingCameraDevice;
+            const clip = camera.videoClips.get(ding_id);
+            const mo = await sdk.mediaManager.createFFmpegMediaObject({
+                inputArguments: [
+                    // it may be h264 or h265.
+                    // '-f', 'h264',
+                    '-i', clip.thumbnail_url,
+                ]
+            });
+            const jpeg = await sdk.mediaManager.convertMediaObjectToBuffer(mo, 'image/jpeg');
+            response.send(jpeg, {
+                headers: {
+                    'Content-Type': 'image/jpeg',
+                }
+            });
+            return;
+        }
+
+        response.send('', {
+            code: 404,
+        });
     }
 
     waiting = false;
@@ -134,7 +160,7 @@ class RingPlugin extends ScryptedDeviceBase implements DeviceProvider, Settings 
                 ffmpegPath: await mediaManager.getFFmpegPath(),
                 locationIds,
                 cameraStatusPollingSeconds: this.settingsStorage.values.polling ? cameraStatusPollingSeconds : undefined,
-                cameraDingsPollingSeconds: this.settingsStorage.values.polling ? this.settingsStorage.values.cameraDingsPollingSeconds : undefined,
+                locationModePollingSeconds: this.settingsStorage.values.polling ? cameraStatusPollingSeconds : undefined,
                 systemId: this.settingsStorage.values.systemId,
             }, {
                 createPeerConnection: () => {

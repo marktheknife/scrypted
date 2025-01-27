@@ -41,15 +41,15 @@ export function isPeerConnectionClosed(pc: RTCPeerConnection) {
         || pc.iceConnectionState === 'closed';
 }
 
-function silence() {
-    let ctx = new AudioContext(), oscillator = ctx.createOscillator();
-    const dest = ctx.createMediaStreamDestination();
-    oscillator.connect(dest);
-    oscillator.start();
-    const ret = dest.stream.getAudioTracks()[0];
-    ret.enabled = false;
-    return ret;
-}
+// function silence() {
+//     let ctx = new AudioContext(), oscillator = ctx.createOscillator();
+//     const dest = ctx.createMediaStreamDestination();
+//     oscillator.connect(dest);
+//     oscillator.start();
+//     const ret = dest.stream.getAudioTracks()[0];
+//     ret.enabled = false;
+//     return ret;
+// }
 
 function createOptions() {
     const options: RTCSignalingOptions = {
@@ -223,7 +223,12 @@ export class BrowserSignalingSession implements RTCSignalingSession {
         }
 
         if (type === 'offer') {
-            let offer = await this.pc.createOffer({
+            let offer: RTCSessionDescriptionInit = this.pc.localDescription;
+            if (offer) {
+                // fast path for duplicate calls to createLocalDescription
+                return toDescription(this.pc.localDescription);
+            }
+            offer = await this.pc.createOffer({
                 offerToReceiveAudio: !!setup.audio,
                 offerToReceiveVideo: !!setup.video,
             });
@@ -232,7 +237,7 @@ export class BrowserSignalingSession implements RTCSignalingSession {
                 return toDescription(offer);
             await set;
             await gatheringPromise;
-            offer = await this.pc.createOffer({
+            offer = this.pc.localDescription || await this.pc.createOffer({
                 offerToReceiveAudio: !!setup.audio,
                 offerToReceiveVideo: !!setup.video,
             });

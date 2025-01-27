@@ -1,11 +1,11 @@
 import { ScryptedInterfaceProperty, ScryptedNativeId } from "@scrypted/types";
 import semver from 'semver';
 import { Plugin } from '../db-types';
+import { httpFetch } from "../fetch/http-fetch";
 import { hasMixinCycle } from "../mixin/mixin-cycle";
 import { ScryptedRuntime } from "../runtime";
 import { sleep } from "../sleep";
 import { getState } from "../state";
-import { httpFetch } from "../fetch/http-fetch";
 
 
 export async function getNpmPackageInfo(pkg: string) {
@@ -50,7 +50,6 @@ export class PluginComponent {
         await this.scrypted.datastore.upsert(pluginDevice);
         const host = this.scrypted.getPluginHostForDeviceId(id);
         await host?.remote?.setNativeId?.(pluginDevice.nativeId, pluginDevice._id, storage);
-        this.scrypted.stateManager.notifyInterfaceEvent(pluginDevice, 'Storage', undefined);
     }
     async setMixins(id: string, mixins: string[]) {
         mixins = mixins || [];
@@ -114,12 +113,22 @@ export class PluginComponent {
         }
         return {
             pid: host?.worker?.pid,
-            stats: host?.stats,
+            clientsCount: host?.io?.clientsCount,
             rpcObjects,
             packageJson,
             pendingResults,
             pendingResultCounts: pendingResultMethods,
             id: this.scrypted.findPluginDevice(pluginId)._id,
+        }
+    }
+
+    async disconnectClients(pluginId: string) {
+        const host = this.scrypted.plugins[pluginId];
+        if (!host)
+            return;
+        const { clients } = host.io as any;
+        for (const client of Object.values(clients)) {
+            (client as any).close()
         }
     }
 
@@ -163,34 +172,16 @@ export class PluginComponent {
         consoleServer.clear(pluginDevice.nativeId);
     }
 
-    async getRemoteServicePort(pluginId: string, name: string, ...args: any[]): Promise<number> {
+    async getRemoteServicePort(pluginId: string, name: string, ...args: any[]): Promise<[number, string]> {
         if (name === 'console') {
             const consoleServer = await this.scrypted.plugins[pluginId].consoleServer;
-            return consoleServer.readPort;
+            return [consoleServer.readPort, process.env.SCRYPTED_CLUSTER_ADDRESS];
         }
         if (name === 'console-writer') {
             const consoleServer = await this.scrypted.plugins[pluginId].consoleServer;
-            return consoleServer.writePort;
+            return [consoleServer.writePort, process.env.SCRYPTED_CLUSTER_ADDRESS];
         }
 
         return this.scrypted.plugins[pluginId].remote.getServicePort(name, ...args);
-    }
-
-    async setHostParam(pluginId: string, name: string, param?: any) {
-        const host = this.scrypted.plugins[pluginId];
-        if (!host)
-            return;
-
-        const key = `oob-param-${name}`;
-        if (param === undefined)
-            delete host.peer.params[key];
-        else
-            host.peer.params[key] = param;
-    }
-
-    async getHostParam(pluginId: string, name: string) {
-        const host = this.scrypted.plugins[pluginId];
-        const key = `oob-param-${name}`;
-        return host?.peer?.params?.[key];
     }
 }

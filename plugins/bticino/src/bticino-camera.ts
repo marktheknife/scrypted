@@ -1,47 +1,49 @@
-import { closeQuiet, createBindUdp, createBindZero, listenZeroSingleClient } from '@scrypted/common/src/listen-cluster';
+import { createBindUdp, listenZeroSingleClient } from '@scrypted/common/src/listen-cluster';
 import { sleep } from '@scrypted/common/src/sleep';
 import { RtspServer } from '@scrypted/common/src/rtsp-server';
 import { addTrackControls, parseSdp } from '@scrypted/common/src/sdp-utils';
 import sdk, { BinarySensor, Camera, DeviceProvider, FFmpegInput, HttpRequest, HttpRequestHandler, HttpResponse, Intercom, MediaObject, MediaStreamUrl, MotionSensor, PictureOptions, Reboot, ResponseMediaStreamOptions, ScryptedDeviceBase, ScryptedMimeTypes, Setting, Settings, SettingValue, VideoCamera, VideoClip, VideoClipOptions, VideoClips } from '@scrypted/sdk';
 import { SipCallSession } from '../../sip/src/sip-call-session';
 import { RtpDescription, getPayloadType, getSequenceNumber, isRtpMessagePayloadType, isStunMessage } from '../../sip/src/rtp-utils';
-import { VoicemailHandler } from './bticino-voicemailHandler';
 import { CompositeSipMessageHandler } from '../../sip/src/compositeSipMessageHandler';
 import { SipHelper } from './sip-helper';
-import child_process, { ChildProcess } from 'child_process';
-import dgram from 'dgram';
+import child_process from 'child_process';
 import { BticinoStorageSettings } from './storage-settings';
 import { BticinoSipPlugin } from './main';
 import { BticinoSipLock } from './bticino-lock';
-import { ffmpegLogInitialOutput, safeKillFFmpeg, safePrintFFmpegArguments } from '@scrypted/common/src/media-helpers';
+import { safePrintFFmpegArguments } from '@scrypted/common/src/media-helpers';
 import { PersistentSipManager } from './persistent-sip-manager';
 import { InviteHandler } from './bticino-inviteHandler';
 import { SipOptions, SipRequest } from '../../sip/src/sip-manager';
+import { startRtpForwarderProcess } from '../../webrtc/src/rtp-forwarders';
+import fs from "fs"
+import url from "url"
+import path from 'path';
+import { default as stream } from 'node:stream'
+import type { ReadableStream } from 'node:stream/web'
+import { finished } from "stream/promises";
 
 import { get } from 'http'
 import { ControllerApi } from './c300x-controller-api';
 import { BticinoAswmSwitch } from './bticino-aswm-switch';
 import { BticinoMuteSwitch } from './bticino-mute-switch';
 
-const STREAM_TIMEOUT = 65000;
 const { mediaManager } = sdk;
+const BTICINO_CLIPS = path.join(process.env.SCRYPTED_PLUGIN_VOLUME, 'bticino-clips');
 
 export class BticinoSipCamera extends ScryptedDeviceBase implements MotionSensor, DeviceProvider, Intercom, Camera, VideoCamera, Settings, BinarySensor, HttpRequestHandler, VideoClips, Reboot {
 
     private session: SipCallSession
     private remoteRtpDescription: Promise<RtpDescription>
-    private audioOutForwarder: dgram.Socket
-    private audioOutProcess: ChildProcess
-    private refreshTimeout: NodeJS.Timeout
+    private forwarder
     public requestHandlers: CompositeSipMessageHandler = new CompositeSipMessageHandler()
     public incomingCallRequest : SipRequest
     private settingsStorage: BticinoStorageSettings = new BticinoStorageSettings( this )
-    private voicemailHandler : VoicemailHandler = new VoicemailHandler(this)
     private inviteHandler : InviteHandler = new InviteHandler(this)
     private controllerApi : ControllerApi = new ControllerApi(this)
     private muteSwitch : BticinoMuteSwitch
     private aswmSwitch : BticinoAswmSwitch
-    private deferredCleanup
+    private deferredCleanup: () => void
     private currentMediaObject : Promise<MediaObject>
     private lastImageRefresh : number
     //TODO: randomize this
@@ -54,7 +56,7 @@ export class BticinoSipCamera extends ScryptedDeviceBase implements MotionSensor
 
     constructor(nativeId: string, public provider: BticinoSipPlugin) {
         super(nativeId)
-        this.requestHandlers.add( this.voicemailHandler ).add( this.inviteHandler )
+        this.requestHandlers.add( this.inviteHandler )
         this.persistentSipManager = new PersistentSipManager( this );
         (async() => {
             this.doorbellWebhookUrl = await this.doorbellWebhookEndpoint()
@@ -143,15 +145,91 @@ export class BticinoSipCamera extends ScryptedDeviceBase implements MotionSensor
             }).on('error', (error) => {
                 this.console.error(error)
                 reject(error)
-            } ).end(); ;                    
+            } ).end();
         });
     }
 
-    getVideoClip(videoId: string): Promise<MediaObject> {
-        let c300x = SipHelper.getIntercomIp(this)
-        const url = `http://${c300x}:8080/voicemail?msg=${videoId}/aswm.avi&raw=true`;
-        return mediaManager.createMediaObjectFromUrl(url);        
+    async getVideoClip(videoId: string): Promise<MediaObject> {
+        const outputfile = await this.fetchAndConvertVoicemailMessage(videoId);
+
+        const fileURLToPath: string = url.pathToFileURL(outputfile).toString()
+        this.console.log(`Creating mediaObject for url: ${fileURLToPath}`)
+        return await mediaManager.createMediaObjectFromUrl(fileURLToPath);
     }
+
+    private async fetchAndConvertVoicemailMessage(videoId: string) {
+        let c300x = SipHelper.getIntercomIp(this)
+
+        const response = await fetch(`http://${c300x}:8080/voicemail?msg=${videoId}/aswm.avi&raw=true`);
+
+        const contentLength: number = Number(response.headers.get("Content-Length"));
+        const lastModified: Date = new Date(response.headers.get("Last-Modified-Time"));
+
+        const avifile = `${BTICINO_CLIPS}/${videoId}.avi`;
+        const outputfile = `${BTICINO_CLIPS}/${videoId}.mp4`;
+
+        if (!fs.existsSync(BTICINO_CLIPS)) {
+            this.console.log(`Creating clips dir at: ${BTICINO_CLIPS}`)
+            fs.mkdirSync(BTICINO_CLIPS);
+        }
+
+        if (fs.existsSync(avifile)) {
+            const stat = fs.statSync(avifile);
+            if (stat.size != contentLength || stat.mtime.getTime() != lastModified.getTime()) {
+                this.console.log(`Size ${stat.size} != ${contentLength} or time ${stat.mtime.getTime} != ${lastModified.getTime}`)
+                try {
+                    fs.rmSync(avifile);
+                } catch (e) { }
+                try {
+                    fs.rmSync(outputfile);
+                } catch (e) { }
+            } else {
+                this.console.log(`Keeping the cached video at ${avifile}`)
+            }
+        }
+
+        if (!fs.existsSync(avifile)) {
+            this.console.log("Starting download.")
+            await finished(stream.Readable.from(response.body as ReadableStream<Uint8Array>).pipe(fs.createWriteStream(avifile)));
+            this.console.log("Download finished.")
+            try {
+                this.console.log(`Setting mtime to ${lastModified}`)
+                fs.utimesSync(avifile, lastModified, lastModified);
+            } catch (e) { }
+        }
+
+        const ffmpegPath = await mediaManager.getFFmpegPath();
+        const ffmpegArgs = [
+            '-hide_banner',
+            '-nostats',
+            '-y',
+            '-i', avifile,
+            outputfile
+        ];
+
+        safePrintFFmpegArguments(console, ffmpegArgs);
+        const cp = child_process.spawn(ffmpegPath, ffmpegArgs, {
+            stdio: ['pipe', 'pipe', 'pipe', 'pipe'],
+        });
+
+        const p = new Promise((resolveFunc) => {
+            cp.stdout.on("data", (x) => {
+                this.console.log(x.toString());
+            });
+            cp.stderr.on("data", (x) => {
+                this.console.error(x.toString());
+            });
+            cp.on("exit", (code) => {
+                resolveFunc(code);
+            });
+        });
+
+        let returnCode = await p;
+
+        this.console.log(`Converted file returned code: ${returnCode}`);
+        return outputfile;
+    }
+
     getVideoClipThumbnail(thumbnailId: string): Promise<MediaObject> {
         let c300x = SipHelper.getIntercomIp(this)
         const url = `http://${c300x}:8080/voicemail?msg=${thumbnailId}/aswm.jpg&raw=true`;
@@ -193,21 +271,26 @@ export class BticinoSipCamera extends ScryptedDeviceBase implements MotionSensor
     }    
 
     async takePicture(option?: PictureOptions): Promise<MediaObject> {
-        const thumbnailCacheTime : number = parseInt( this.storage?.getItem('thumbnailCacheTime') ) * 1000 || 300000 
-        const now = new Date().getTime()
-        if( !this.lastImageRefresh || this.lastImageRefresh + thumbnailCacheTime < now ) {
-            // get a proxy object to make sure we pass prebuffer when already watching a stream
-            let cam : VideoCamera = sdk.systemManager.getDeviceById<VideoCamera>(this.id)
-            let vs : MediaObject = await cam.getVideoStream()
-            let buf : Buffer = await mediaManager.convertMediaObjectToBuffer(vs, 'image/jpeg');
-            this.cachedImage = buf
-            this.lastImageRefresh = new Date().getTime()
-            this.console.log(`Camera picture updated and cached: ${this.lastImageRefresh} + cache time: ${thumbnailCacheTime} < ${now}`)
-
+        let rebroadcastEnabled = this.interfaces?.includes( "mixin:@scrypted/prebuffer-mixin")
+        if( rebroadcastEnabled ) {
+            const thumbnailCacheTime : number = parseInt( this.storage?.getItem('thumbnailCacheTime') ) * 1000 || 300000 
+            const now = new Date().getTime()
+            if( !this.lastImageRefresh || this.lastImageRefresh + thumbnailCacheTime < now ) {
+                // get a proxy object to make sure we pass prebuffer when already watching a stream
+                let cam : VideoCamera = sdk.systemManager.getDeviceById<VideoCamera>(this.id)
+                let vs : MediaObject = await cam.getVideoStream()
+                this.cachedImage = await mediaManager.convertMediaObjectToBuffer(vs, 'image/jpeg');
+                this.lastImageRefresh = new Date().getTime()
+                this.console.log(`Camera picture updated and cached: ${this.lastImageRefresh} + cache time: ${thumbnailCacheTime} < ${now}`)
+    
+            } else {
+                this.console.log(`Not refreshing camera picture: ${this.lastImageRefresh} + cache time: ${thumbnailCacheTime} < ${now}`)
+            }
+            
+            return mediaManager.createMediaObject(this.cachedImage, 'image/jpeg')
         } else {
-            this.console.log(`Not refreshing camera picture: ${this.lastImageRefresh} + cache time: ${thumbnailCacheTime} < ${now}`)
+            throw new Error("To enable snapshots, enable rebroadcast plugin or set a Snapshot URL in the Snapshot plugin to an external image.");
         }
-        return mediaManager.createMediaObject(this.cachedImage, 'image/jpeg')
     }
 
     async getPictureOptions(): Promise<PictureOptions[]> {
@@ -234,58 +317,31 @@ export class BticinoSipCamera extends ScryptedDeviceBase implements MotionSensor
             this.session = await this.callIntercom( cleanup )
         }
             
-
         this.stopIntercom();
 
-        const ffmpegInput: FFmpegInput = JSON.parse((await mediaManager.convertMediaObjectToBuffer(media, ScryptedMimeTypes.FFmpegInput)).toString());
-
-        const audioOutForwarder = await createBindZero()
-        this.audioOutForwarder = audioOutForwarder.server
+        const ffmpegInput = await sdk.mediaManager.convertMediaObjectToJSON<FFmpegInput>(media, ScryptedMimeTypes.FFmpegInput);
         let address = (await this.remoteRtpDescription).address
-        audioOutForwarder.server.on('message', message => {
-            if( this.session )
-                this.session.audioSplitter.send(message, 40004, address)
-            return null
-        });
-
-        const args = ffmpegInput.inputArguments.slice();
-        args.push(
-            '-vn', '-dn', '-sn',
-            '-acodec', 'speex',
-            '-flags', '+global_header',
-            '-ac', '1',
-            '-ar', '8k',
-            '-f', 'rtp',
-            //'-srtp_out_suite', 'AES_CM_128_HMAC_SHA1_80',
-            //'-srtp_out_params', encodeSrtpOptions(this.decodedSrtpOptions),
-            `rtp://127.0.0.1:${audioOutForwarder.port}?pkt_size=188`,
-        );
-
-        this.console.log("===========================================")
-        safePrintFFmpegArguments( this.console, args )
-        this.console.log("===========================================")
-
-        const cp = child_process.spawn(await mediaManager.getFFmpegPath(), args);
-        ffmpegLogInitialOutput(this.console, cp)
-        this.audioOutProcess = cp;
-        cp.on('exit', () => this.console.log('two way audio ended'));
-        this.session.onCallEnded.subscribe(() => {
-            closeQuiet(audioOutForwarder.server);
-            safeKillFFmpeg(cp)
+        this.forwarder = await startRtpForwarderProcess(this.console, ffmpegInput, {
+            audio: {
+                codecCopy: 'speex',
+                encoderArguments: [
+                    '-vn', '-sn', '-dn',
+                    '-acodec', 'speex',
+                    '-flags', '+global_header',
+                    '-ac', '1',
+                    '-ar', '8k',
+                    '-f', 'rtp',
+                ],
+                onRtp: rtp => {
+                        this.session?.audioSplitter?.send(rtp, 40004, address)
+                }
+            }
         });
     }
 
     async stopIntercom(): Promise<void> {
-        closeQuiet(this.audioOutForwarder)
-        this.audioOutProcess?.kill('SIGKILL')
-        this.audioOutProcess = undefined
-        this.audioOutForwarder = undefined
-    }
-
-    resetStreamTimeout() {
-        this.log.d('starting/refreshing stream')
-        clearTimeout(this.refreshTimeout)
-        this.refreshTimeout = setTimeout(() => this.stopSession(), STREAM_TIMEOUT)
+        this.forwarder?.kill()
+        this.forwarder = undefined
     }
 
     hasActiveCall() {
@@ -294,7 +350,7 @@ export class BticinoSipCamera extends ScryptedDeviceBase implements MotionSensor
 
     stopSession() {
         if (this.session) {
-            this.log.d('ending sip session')
+            this.console.log('ending sip session')
             this.session.stop()
             this.session = undefined
         }
@@ -339,7 +395,7 @@ export class BticinoSipCamera extends ScryptedDeviceBase implements MotionSensor
                     if (this.session === sip)
                         this.session = undefined
                     try {
-                        this.log.d('cleanup(): stopping sip session.')
+                        this.console.log('cleanup(): stopping sip session.')
                         sip?.stop()
                         this.currentMediaObject = undefined
                     }
@@ -412,7 +468,7 @@ export class BticinoSipCamera extends ScryptedDeviceBase implements MotionSensor
 
                 this.session = sip
 
-                videoSplitter.server.on('message', (message, rinfo) => {
+                videoSplitter.server.on('message', (message:Buffer) => {
                      if ( !isStunMessage(message)) {
                             const isRtpMessage = isRtpMessagePayloadType(getPayloadType(message));
                             if (!isRtpMessage)
@@ -431,7 +487,7 @@ export class BticinoSipCamera extends ScryptedDeviceBase implements MotionSensor
                         }
                 });
 
-                audioSplitter.server.on('message', (message, rinfo ) => {
+                audioSplitter.server.on('message', (message:Buffer) => {
                         if ( !isStunMessage(message)) {
                             const isRtpMessage = isRtpMessagePayloadType(getPayloadType(message));
                             if (!isRtpMessage)
@@ -489,12 +545,24 @@ export class BticinoSipCamera extends ScryptedDeviceBase implements MotionSensor
         // Call the C300X
         this.remoteRtpDescription = sip.callOrAcceptInvite(
             ( audio ) => {
-            return [
-                // this SDP is used by the intercom and will send the encrypted packets which we don't care about to the loopback on port 65000 of the intercom
-                `m=audio 65000 RTP/SAVP 110`,
-                `a=rtpmap:110 speex/8000`,
-                `a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:${this.keyAndSalt}`,
-            ]
+                let audioSection = [
+                    // this SDP is used by the intercom and will send the encrypted packets which we don't care about to the loopback on port 65000 of the intercom
+                    `m=audio 65000 RTP/SAVP 110`,
+                    `a=rtpmap:110 speex/8000`,
+                    `a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:${this.keyAndSalt}`,
+                ]
+                if( !this.incomingCallRequest ) {
+                    let DEVADDR = this.storage.getItem('DEVADDR');
+                    if( DEVADDR ) {
+                        audioSection.unshift('a=DEVADDR:' + DEVADDR)
+                    } else {
+                        if( sipOptions.to.toLocaleLowerCase().indexOf('c300x') >= 0 || sipOptions.to.toLocaleLowerCase().indexOf('c100x') >= 0 ) {
+                            // Needed for bt_answering_machine (bticino specific), to check for c100X
+                            audioSection.unshift('a=DEVADDR:20')
+                        }                           
+                    }
+                }
+                return audioSection
         }, ( video ) => {
                 return [
                 // this SDP is used by the intercom and will send the encrypted packets which we don't care about to the loopback on port 65000 of the intercom
@@ -538,13 +606,17 @@ export class BticinoSipCamera extends ScryptedDeviceBase implements MotionSensor
 
     async getDevice(nativeId: string) : Promise<any> {
         if( nativeId && nativeId.endsWith('-aswm-switch')) {
-            this.aswmSwitch = new BticinoAswmSwitch(this, this.voicemailHandler)
+            this.aswmSwitch = new BticinoAswmSwitch(this)
+            this.aswmSwitch.info = this.info
             return this.aswmSwitch
         } else if( nativeId && nativeId.endsWith('-mute-switch') ) {
             this.muteSwitch = new BticinoMuteSwitch(this)
+            this.muteSwitch.info = this.info
             return this.muteSwitch
         }
-        return new BticinoSipLock(this)
+        const lock = new BticinoSipLock(this)
+        lock.info = this.info
+        return lock
     }
 
     async releaseDevice(id: string, nativeId: string): Promise<void> {
@@ -554,7 +626,6 @@ export class BticinoSipCamera extends ScryptedDeviceBase implements MotionSensor
             this.muteSwitch.cancelTimer()
         } else {
             this.stopIntercom()
-            this.voicemailHandler.cancelTimer()
             this.persistentSipManager.cancelTimer()        
             this.controllerApi.cancelTimer()
         }

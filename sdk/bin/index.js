@@ -7,8 +7,6 @@ const axios = require('axios').create({
 const process = require('process');
 const path = require('path');
 const fs = require('fs');
-const chalk = require('chalk');
-
 
 function getUserHome() {
     const ret = process.env[(process.platform == 'win32') ? 'USERPROFILE' : 'HOME'];
@@ -56,7 +54,7 @@ exports.deploy = function (debugHost, noRebind) {
 
     return new Promise((resolve, reject) => {
         var out;
-        if (process.env.NODE_ENV == 'production')
+        if (process.env.NODE_ENV === 'production')
             out = path.resolve(process.cwd(), 'dist');
         else
             out = path.resolve(process.cwd(), 'out');
@@ -127,7 +125,7 @@ exports.deploy = function (debugHost, noRebind) {
             .catch((err) => {
                 console.error(err.message);
                 if (err.response && err.response.data) {
-                    console.log(chalk.red(err.response.data));
+                    console.log('\x1b[31m%s\x1b[0m', err.response.data);
                 }
                 reject(err);
             });
@@ -138,12 +136,11 @@ exports.debug = function (debugHost, entryPoint) {
     debugHost = toIpAndPort(debugHost);
 
     return new Promise((resolve, reject) => {
-        const outFilename = entryPoint || 'main.nodejs.js';
         var packageJson = path.resolve(process.cwd(), 'package.json');
         packageJson = JSON.parse(fs.readFileSync(packageJson));
         const npmPackage = packageJson.name || '';
 
-        const debugUrl = `https://${debugHost}/web/component/script/debug?filename=${outFilename}&npmPackage=${npmPackage}`
+        const debugUrl = `https://${debugHost}/web/component/script/debug?npmPackage=${npmPackage}`
         console.log(`initiating debugger on ${debugHost}`);
 
         axios.post(debugUrl, undefined, {
@@ -161,7 +158,7 @@ exports.debug = function (debugHost, entryPoint) {
             .catch((err) => {
                 console.error(err.message);
                 if (err.response && err.response.data) {
-                    console.log(chalk.red(err.response.data));
+                    console.log('\x1b[31m%s\x1b[0m', err.response.data);
                 }
                 reject(err);
             });

@@ -12,10 +12,15 @@ async function sleep(ms: number) {
 
 const EXIT_FILE = '.exit';
 const UPDATE_FILE = '.update';
+const VERSION_FILE = '.version';
 
 async function runCommand(command: string, ...args: string[]) {
-    if (os.platform() === 'win32')
+    if (os.platform() === 'win32') {
         command += '.cmd';
+        // wrap each argument in a quote to handle spaces in paths
+        // https://github.com/nodejs/node/issues/38490#issuecomment-927330248
+        args = args.map(arg => '"' + arg + '"');
+    }
     console.log('running', command, ...args);
     const cp = child_process.spawn(command, args, {
         stdio: 'inherit',
@@ -24,6 +29,8 @@ async function runCommand(command: string, ...args: string[]) {
             // https://github.com/lovell/sharp/blob/eefaa998725cf345227d94b40615e090495c6d09/lib/libvips.js#L115C19-L115C46
             SHARP_IGNORE_GLOBAL_LIBVIPS: 'true',
         },
+        // allow spawning .cmd https://nodejs.org/en/blog/vulnerability/april-2024-security-releases-2
+        shell: os.platform() === 'win32' ? true : undefined,
     });
     await once(cp, 'exit');
     if (cp.exitCode)
@@ -84,7 +91,13 @@ export async function installServe(installVersion: string, ignoreError?: boolean
     const installJson = path.join(installDir, 'install.json');
     try {
         const { version } = JSON.parse(fs.readFileSync(installJson).toString());
-        if (semver.parse(process.version).major !== semver.parse(version).major)
+        const processSemver = semver.parse(process.version);
+        if (!processSemver)
+            throw new Error('error parsing process version');
+        const installSemver = semver.parse(version);
+        if (!installSemver)
+            throw new Error('error parsing install.json version');
+        if (processSemver.major !== installSemver.major)
             throw new Error('mismatch');
     }
     catch (e) {
@@ -105,17 +118,45 @@ export async function installServe(installVersion: string, ignoreError?: boolean
 }
 
 export async function serveMain(installVersion?: string) {
-    let install = !!installVersion;
-
     const { installDir, volume } = cwdInstallDir();
-    if (!fs.existsSync('node_modules/@scrypted/server')) {
-        install = true;
-        installVersion ||= 'latest';
-        console.log('Package @scrypted/server not found. Installing.');
+    if (!installVersion) {
+        try {
+            installVersion = fs.readFileSync(path.join(volume, VERSION_FILE)).toString().trim();
+        }
+        catch (e) {
+        }
     }
-    if (install) {
-        await installServe(installVersion, true);
+
+    const options = ((): { install: true; version: string } | { install: false } => {
+        if (installVersion) {
+            console.log(`Installing @scrypted/server@${installVersion}`);
+            return {
+                install: true, 
+                version: installVersion
+            };
+        }
+
+        if (!fs.existsSync('node_modules/@scrypted/server')) {
+            console.log('Package @scrypted/server not found. Installing.');
+            return {
+                install: true,
+                version: 'latest',
+            };
+        }
+
+        return {
+            install: false,
+        }
+    })();
+
+
+    if (options.install) {
+        await installServe(options.version, true);
     }
+
+    // todo: remove at some point after core lxc updater rolls out.
+    if (process.env.SCRYPTED_INSTALL_ENVIRONMENT === 'lxc')
+        process.env.SCRYPTED_FFMPEG_PATH = '/usr/bin/ffmpeg';
 
     process.env.SCRYPTED_NPM_SERVE = 'true';
     process.env.SCRYPTED_VOLUME = volume;
@@ -129,16 +170,20 @@ export async function serveMain(installVersion?: string) {
 
         await startServer(installDir);
 
-        if (fs.existsSync(EXIT_FILE)) {
-            console.log('Exiting.');
-            process.exit();
-        }
-        else if (fs.existsSync(UPDATE_FILE)) {
+        if (fs.existsSync(UPDATE_FILE)) {
             console.log('Update requested. Installing.');
-            await runCommandEatError('npm', '--prefix', installDir, 'install', '--production', '@scrypted/server@latest');
+            await runCommandEatError('npm', '--prefix', installDir, 'install', '--production', '@scrypted/server@latest').catch(e => {
+                console.error('Update failed', e);
+            });
+            console.log('Exiting.');
+            process.exit(1);
+        }
+        else if (fs.existsSync(EXIT_FILE)) {
+            console.log('Exiting.');
+            process.exit(1);
         }
         else {
-            console.log(`Service exited. Restarting momentarily.`);
+            console.log(`Service unexpectedly exited. Restarting momentarily.`);
             await sleep(10000);
         }
     }

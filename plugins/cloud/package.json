@@ -30,28 +30,27 @@
       "realfs": true,
       "interfaces": [
          "SystemSettings",
-         "BufferConverter",
+         "MediaConverter",
          "OauthClient",
          "Settings",
-         "DeviceProvider",
          "HttpRequestHandler"
       ]
    },
    "dependencies": {
-      "@eneris/push-receiver": "^3.1.4",
+      "@eneris/push-receiver": "^4.3.0",
       "@scrypted/common": "file:../../common",
       "@scrypted/sdk": "file:../../sdk",
       "bpmux": "^8.2.1",
-      "cloudflared": "^0.4.0",
+      "cloudflared": "^0.5.3",
       "exponential-backoff": "^3.1.1",
       "http-proxy": "^1.18.1",
       "nat-upnp": "file:./external/node-nat-upnp"
    },
    "devDependencies": {
-      "@types/http-proxy": "^1.17.11",
-      "@types/ip": "^1.1.0",
-      "@types/nat-upnp": "^1.1.2",
-      "@types/node": "^20.4.5"
+      "@types/http-proxy": "^1.17.15",
+      "@types/nat-upnp": "^1.1.5",
+      "@types/node": "^22.10.1",
+      "ts-node": "^10.9.2"
    },
-   "version": "0.2.6"
+   "version": "0.2.49"
 }

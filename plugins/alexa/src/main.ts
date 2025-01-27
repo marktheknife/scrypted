@@ -27,6 +27,7 @@ class AlexaPlugin extends ScryptedDeviceBase implements HttpRequestHandler, Mixi
             json: true
         },
         syncedDevices: {
+            defaultValue: [],
             multiple: true,
             hide: true
         },
@@ -47,7 +48,17 @@ class AlexaPlugin extends ScryptedDeviceBase implements HttpRequestHandler, Mixi
             onPut(oldValue: boolean, newValue: boolean) {
                 DEBUG = newValue;
             }
-        }
+        },
+        pairedUserId: {
+            title: "Pairing Key",
+            description: "The pairing key used to validate requests from Alexa. Clear this key or delete the plugin to allow pairing with a different Alexa login.",
+        },
+        disableAutoAdd: {
+            title: "Disable auto add",
+            description: "Disable automatic enablement of devices.",
+            type: 'boolean',
+            defaultValue: false,
+        },
     });
 
     accessToken: Promise<string>;
@@ -62,7 +73,10 @@ class AlexaPlugin extends ScryptedDeviceBase implements HttpRequestHandler, Mixi
         alexaHandlers.set('Alexa.Authorization/AcceptGrant', this.onAlexaAuthorization);
         alexaHandlers.set('Alexa.Discovery/Discover', this.onDiscoverEndpoints);
 
-        this.start();
+        this.start()
+            .catch(e => {
+                this.console.error('startup failed', e);
+            })
     }
 
     async start() {
@@ -107,6 +121,10 @@ class AlexaPlugin extends ScryptedDeviceBase implements HttpRequestHandler, Mixi
 
         if (!supportedTypes.has(device.type))
             return DeviceMixinStatus.NotSupported;
+
+        if (this.storageSettings.values.disableAutoAdd) {
+            return DeviceMixinStatus.Skip;
+        }
 
         mixins.push(this.id);
 
@@ -599,11 +617,22 @@ class AlexaPlugin extends ScryptedDeviceBase implements HttpRequestHandler, Mixi
             try {
                 debug("making authorization request to Scrypted");
 
-                await axios.get('https://home.scrypted.app/_punch/getcookie', {
+                const getcookieResponse = await axios.get('https://home.scrypted.app/_punch/getcookie', {
                     headers: {
                         'Authorization': authorization,
                     }
                 });
+                // new tokens will contain a lot of information, including the expiry and client id.
+                // validate this. old tokens will be grandfathered in.
+                if (getcookieResponse.data.expiry && getcookieResponse.data.clientId !== 'amazon')
+                    throw new Error('client id mismatch');
+                if (!this.storageSettings.values.pairedUserId) {
+                    this.storageSettings.values.pairedUserId = getcookieResponse.data.id;
+                }
+                else if (this.storageSettings.values.pairedUserId !== getcookieResponse.data.id) {
+                    this.log.a('This plugin is already paired with a different account. Clear the existing key in the plugin settings to pair this plugin with a different account.');
+                    throw new Error('user id mismatch');
+                }
                 this.validAuths.add(authorization);
             }
             catch (e) {
@@ -652,7 +681,8 @@ class AlexaPlugin extends ScryptedDeviceBase implements HttpRequestHandler, Mixi
 enum DeviceMixinStatus {
     NotSupported = 0,
     Setup = 1,
-    AlreadySetup = 2
+    AlreadySetup = 2,
+    Skip = 3,
 }
 
 class HttpResponseLoggingImpl implements AlexaHttpResponse {

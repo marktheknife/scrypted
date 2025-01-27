@@ -39,9 +39,7 @@ launchctl unload ~/Library/LaunchAgents/app.scrypted.server.plist || echo ""
 echo "Installing Scrypted dependencies..."
 RUN_IGNORE xcode-select --install
 RUN brew update
-RUN_IGNORE brew install node@18
-# snapshot plugin and others
-RUN brew install libvips
+RUN_IGNORE brew install node@20
 # dlib
 RUN brew install cmake
 
@@ -71,27 +69,30 @@ then
 fi
 
 RUN python$PYTHON_VERSION -m pip install --upgrade pip
+# besides debugpy, none of these dependencies are needed anymore?
+# portable python includes typing and does not need typing_extensions.
+# opencv-python-headless has wheels for macos.
 if [ "$PYTHON_VERSION" != "3.10" ]
 then
     RUN python$PYTHON_VERSION -m pip install typing
 fi
-RUN python$PYTHON_VERSION -m pip install debugpy typing_extensions opencv-python psutil
+RUN python$PYTHON_VERSION -m pip install debugpy typing_extensions opencv-python
 
 echo "Installing Scrypted Launch Agent..."
 
 RUN mkdir -p ~/Library/LaunchAgents
 
-NODE_PATH=$(brew --prefix node@18)
+NODE_PATH=$(brew --prefix node@20)
 if [ ! -d "$NODE_PATH" ]
 then
-    echo "Unable to determine node@18 path."
+    echo "Unable to determine node@20 path."
     exit 1
 fi
 
 NODE_BIN_PATH=$NODE_PATH/bin
 if [ ! -d "$NODE_BIN_PATH" ]
 then
-    echo "Unable to determine node@18 bin path."
+    echo "Unable to determine node@20 bin path."
     echo "$NODE_BIN_PATH does not exist."
     exit 1
 fi
@@ -121,7 +122,7 @@ then
 fi
 
 echo "Installing Scrypted..."
-RUN $NPX_PATH -y scrypted@latest install-server
+RUN $NPX_PATH -y scrypted@latest install-server $SCRYPTED_INSTALL_VERSION
 
 cat > ~/Library/LaunchAgents/app.scrypted.server.plist <<EOT
 <?xml version="1.0" encoding="UTF-8"?>
