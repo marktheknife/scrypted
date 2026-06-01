@@ -162,7 +162,7 @@ export async function* handleFragmentsRequests(streamId: number, device: Scrypte
         session = {
             socket,
             cp: undefined,
-            generator: parseFragmentedMP4(socket),
+            generator: parseFragmentedMP4(socket, 30000),
         }
     }
     else {
