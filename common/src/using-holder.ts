@@ -14,7 +14,7 @@ export abstract class AsyncUsingHolderBase<T> {
 
     detach() {
         const value = this._value;
-        this._value = undefined;
+        this._value = undefined!;
         return value;
     }
 
@@ -47,7 +47,7 @@ export abstract class UsingHolderBase<T> {
 
     detach() {
         const value = this._value;
-        this._value = undefined;
+        this._value = undefined!;
         return value;
     }
 
