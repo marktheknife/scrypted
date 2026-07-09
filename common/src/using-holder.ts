@@ -19,10 +19,12 @@ export abstract class AsyncUsingHolderBase<T> {
     }
 
     async replace(value: T) {
-        if (this._value === value)
-            return;
-        await this.release();
+        const oldValue = this._value;
         this._value = value;
+        if (oldValue === value)
+            return;
+        if (oldValue)
+            await this.asyncDispose(oldValue);
     }
 
     async release() {
