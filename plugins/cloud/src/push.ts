@@ -44,7 +44,7 @@ export class PushManager extends EventEmitter {
             const deferred = new Deferred<string>();
 
             const saveConfig = () => {
-                savedConfig.persistentIds = savedConfig.persistentIds?.slice(0, -100);
+                savedConfig.persistentIds = savedConfig.persistentIds?.slice(-100);
                 localStorage.setItem('config', JSON.stringify(savedConfig));
             }
 
@@ -62,7 +62,6 @@ export class PushManager extends EventEmitter {
                 saveConfig();
                 this.emit('message', message.data);
             });
-
             try {
                 await instance.connect();
             }
