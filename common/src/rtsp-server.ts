@@ -40,7 +40,33 @@ export async function readMessage(client: Readable): Promise<string[]> {
     let currentHeaders: string[] = [];
     while (true) {
         let line = await readLine(client);
-        line = line.trim();
+
+        const isContinuation = line.startsWith(' ');
+
+        // RTSP/1.0 200 OK\r\n
+        // Server: Customer RTSP Server/1.0.0\r\n
+        // CSeq: 6\r\n
+        // Session: 821724453759789\r\n
+        //  \r\n
+        // RTP-Info: url=rtsp://192.168.2.236:554/profile1/track1;seq=56350;rtptime=1173786446,url=rtsp://192.168.2.236:554/profile1/track2;seq=26367;rtptime=530583461\r\n
+        // \r\n
+        // $\x03\x00\x38\x80\xc8\x00\x06...
+
+        // the above is a continuation header. lines that begin with a whitespace are continuation lines and should be appended to the previous header.
+        // Session: 821724453759789<whitespace>
+
+        while (line.endsWith('\r') || line.endsWith('\n')) {
+            line = line.slice(0, -1);
+        }
+
+        if (isContinuation) {
+            if (!currentHeaders.length)
+                throw new Error('Continuation line found without a previous header');
+            const previousHeader = currentHeaders.pop();
+            currentHeaders.push(previousHeader + line);
+            continue;
+        }
+
         if (!line)
             return currentHeaders;
         currentHeaders.push(line);
@@ -942,18 +968,11 @@ export class RtspServer {
     }
 
     async handleSetup(methods = ['play', 'record', 'teardown']) {
-        let currentHeaders: string[] = [];
         while (true) {
-            let line = await readLine(this.client);
-            line = line.trim();
-            if (!line) {
-                const method = await this.headers(currentHeaders);
-                if (methods.includes(method))
-                    return method;
-                currentHeaders = [];
-                continue;
-            }
-            currentHeaders.push(line);
+            const currentHeaders = await readMessage(this.client);
+            const method = await this.headers(currentHeaders);
+            if (methods.includes(method))
+                return method;
         }
     }
 
