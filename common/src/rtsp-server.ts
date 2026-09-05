@@ -41,7 +41,7 @@ export async function readMessage(client: Readable): Promise<string[]> {
     while (true) {
         let line = await readLine(client);
 
-        const isContinuation = line.startsWith(' ');
+        const isContinuation = line.startsWith(' ') || line.startsWith('\t');
 
         // RTSP/1.0 200 OK\r\n
         // Server: Customer RTSP Server/1.0.0\r\n
